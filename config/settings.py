@@ -25,3 +25,13 @@ class NewsSettings:
 
 
 news_settings = NewsSettings()
+
+
+@dataclass(frozen=True)
+class DecisionSettings:
+    decision_interval_sec: int = 15 * 60  # 15분마다 유니버스 전체 판단
+    price_lookback_hours: int = 1  # 시세 흐름 조회 범위
+    request_delay_sec: float = 1.0  # 종목별 Claude 호출 간 요청 간격 (레이트리밋 여유)
+
+
+decision_settings = DecisionSettings()

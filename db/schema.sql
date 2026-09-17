@@ -26,3 +26,20 @@ CREATE TABLE IF NOT EXISTS disclosures (
 
 CREATE INDEX IF NOT EXISTS idx_disclosures_stock_code_rcept_dt
     ON disclosures (stock_code, rcept_dt);
+
+-- AI 판단 로그 (decision/main.py). 페이퍼 모드 — 실제 매매 없이 판단만 기록한다.
+-- context_snapshot에 판단 시점 입력 데이터 전체를 JSON으로 같이 저장해서
+-- "왜 이렇게 판단했는지" 나중에 재구성할 수 있게 한다.
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stk_cd TEXT NOT NULL,
+    decided_at TEXT NOT NULL,
+    action TEXT NOT NULL,
+    confidence INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    context_snapshot TEXT NOT NULL,
+    model TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_decisions_stk_cd_decided_at
+    ON decisions (stk_cd, decided_at);
