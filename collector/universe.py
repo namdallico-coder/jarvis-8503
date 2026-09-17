@@ -1,52 +1,50 @@
-"""코스피/코스닥 상위 시가총액 종목 유니버스 선정.
+"""코스피/코스닥 상위 종목 유니버스 선정.
 
-pykrx로 KOSPI + KOSDAQ 시가총액 데이터를 조회해 상위 `size`개 종목코드를 뽑는다.
-실제 가격 조회(키움 API)는 collector/kiwoom_client.py 가 담당한다.
+키움 REST API 거래대금상위요청(ka10032, /api/dostk/rkinfo)으로 유니버스를 뽑는다.
+키움 순위정보 TR에는 시가총액 전용 랭킹이 없어, 통합시장 거래대금 상위를
+"상위 시가총액/주요 종목" 유니버스의 대용치로 사용한다.
+
+인증 및 공통 요청 처리는 collector/kiwoom_client.py(KiwoomQuoteClient)와 공유한다.
+
+스펙 출처: https://github.com/Kiwoom-Securities/Kiwoom-REST-API
+  examples/국내주식/순위정보/get_domestic_trading_value_top.py
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import date, timedelta
 from typing import List
 
-import pandas as pd
-from pykrx import stock
+from collector.kiwoom_client import KiwoomQuoteClient
 
 logger = logging.getLogger("collector.universe")
 
-_MARKETS = ("KOSPI", "KOSDAQ")
-_MAX_LOOKBACK_DAYS = 10
+RANKING_PATH = "/api/dostk/rkinfo"
+RANKING_API_ID = "ka10032"
+RESPONSE_KEY = "trde_prica_upper"
+
+# mrkt_tp: 000=전체(코스피+코스닥 통합), 001=코스피, 101=코스닥
+MARKET_ALL = "000"
 
 
-def _latest_market_cap(markets: tuple[str, ...] = _MARKETS) -> pd.DataFrame:
-    """최근 영업일 기준 시가총액 데이터를 조회한다.
-
-    휴장일(주말/공휴일)에는 데이터가 비어 있으므로, 데이터가 나올 때까지
-    최대 _MAX_LOOKBACK_DAYS일 전까지 거슬러 올라간다.
-    """
-    day = date.today()
-    for _ in range(_MAX_LOOKBACK_DAYS):
-        ymd = day.strftime("%Y%m%d")
-        frames = []
-        for market in markets:
-            df = stock.get_market_cap_by_ticker(ymd, market=market)
-            if not df.empty:
-                df = df.copy()
-                df["시장"] = market
-                frames.append(df)
-        if frames:
-            return pd.concat(frames)
-        day -= timedelta(days=1)
-    raise RuntimeError(
-        f"최근 {_MAX_LOOKBACK_DAYS}일 내 시가총액 데이터를 조회하지 못했습니다."
+async def get_universe(
+    client: KiwoomQuoteClient,
+    size: int = 30,
+    mrkt_tp: str = MARKET_ALL,
+    mang_stk_incls: str = "0",  # 0: 관리종목 미포함
+    stex_tp: str = "3",  # 1: KRX, 2: NXT, 3: 통합
+) -> List[str]:
+    """코스피 + 코스닥 거래대금 상위 `size`개 종목코드를 반환한다."""
+    data = await client.request(
+        path=RANKING_PATH,
+        api_id=RANKING_API_ID,
+        body={
+            "mrkt_tp": mrkt_tp,
+            "mang_stk_incls": mang_stk_incls,
+            "stex_tp": stex_tp,
+        },
     )
-
-
-def get_universe(size: int = 30) -> List[str]:
-    """코스피 + 코스닥 시가총액 상위 `size`개 종목코드를 반환한다."""
-    market_cap = _latest_market_cap()
-    top = market_cap.sort_values("시가총액", ascending=False).head(size)
-    tickers = top.index.tolist()
+    rows = data.get(RESPONSE_KEY, [])
+    tickers = [row["stk_cd"] for row in rows[:size] if row.get("stk_cd")]
     logger.info("universe selected: %d tickers", len(tickers))
     return tickers
