@@ -6,13 +6,14 @@ collector/universe.py(순위정보 조회)와 fetch_quotes(시세 조회)가 이
 스펙 출처: https://github.com/Kiwoom-Securities/Kiwoom-REST-API
   - kiwoom/core/auth.py   (토큰 발급: POST /oauth2/token)
   - kiwoom/core/client.py (공통 요청 헤더: api-id, authorization)
+  - examples/국내주식/종목정보/get_domestic_stock_info.py (ka10001: 현재가/거래량 포함)
 
-TODO:
-  - 시세 조회 TR(api-id) 확정 후 fetch_quotes 구현
+종목코드는 거래소별 접미사를 그대로 사용한다 (KRX: 039490, NXT: 039490_NX, SOR/통합: 039490_AL).
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -21,6 +22,9 @@ import httpx
 
 KST = timezone(timedelta(hours=9))
 TOKEN_PATH = "/oauth2/token"
+QUOTE_PATH = "/api/dostk/stkinfo"
+QUOTE_API_ID = "ka10001"  # 주식기본정보요청
+QUOTE_REQUEST_DELAY_SECONDS = 0.2  # 종목별 순차 조회 간 요청 간격
 
 
 class QuoteClientError(Exception):
@@ -127,5 +131,34 @@ class KiwoomQuoteClient:
         return data
 
     async def fetch_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
-        """종목코드 목록에 대한 현재가 시세를 조회한다."""
-        raise NotImplementedError("시세 조회 API 연동은 아직 구현되지 않았습니다.")
+        """종목코드 목록에 대한 현재가/거래량을 순차 조회한다 (ka10001, 1건씩만 지원)."""
+        quotes: List[Dict[str, Any]] = []
+        for i, symbol in enumerate(symbols):
+            data = await self.request(
+                path=QUOTE_PATH,
+                api_id=QUOTE_API_ID,
+                body={"stk_cd": symbol},
+            )
+            quotes.append(
+                {
+                    "stk_cd": data.get("stk_cd") or symbol,
+                    "stk_nm": data.get("stk_nm"),
+                    "cur_prc": _parse_signed_int(data.get("cur_prc")),
+                    "trde_qty": _parse_signed_int(data.get("trde_qty")),
+                }
+            )
+            if i + 1 < len(symbols):
+                await asyncio.sleep(QUOTE_REQUEST_DELAY_SECONDS)
+        return quotes
+
+
+def _parse_signed_int(value: Optional[str]) -> Optional[int]:
+    """키움 현재가/거래량 필드는 실제 부호가 아니라 등락 방향 표시용 +/- 접두사가 붙어
+    내려온다 (예: 하락 종목의 현재가도 '-106280'으로 내려옴). 절대값으로 정규화한다.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return abs(int(text))
