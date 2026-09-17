@@ -7,6 +7,7 @@ collector/universe.py(순위정보 조회)와 fetch_quotes(시세 조회)가 이
   - kiwoom/core/auth.py   (토큰 발급: POST /oauth2/token)
   - kiwoom/core/client.py (공통 요청 헤더: api-id, authorization)
   - examples/국내주식/종목정보/get_domestic_stock_info.py (ka10001: 현재가/거래량 포함)
+  - examples/국내주식/종목정보/list_domestic_stocks.py (ka10099: 시장구분별 종목 리스트)
 
 종목코드는 거래소별 접미사를 그대로 사용한다 (KRX: 039490, NXT: 039490_NX, SOR/통합: 039490_AL).
 """
@@ -24,6 +25,7 @@ KST = timezone(timedelta(hours=9))
 TOKEN_PATH = "/oauth2/token"
 QUOTE_PATH = "/api/dostk/stkinfo"
 QUOTE_API_ID = "ka10001"  # 주식기본정보요청
+STOCK_LIST_API_ID = "ka10099"  # 종목정보 리스트
 QUOTE_REQUEST_DELAY_SECONDS = 0.2  # 종목별 순차 조회 간 요청 간격
 
 
@@ -98,14 +100,14 @@ class KiwoomQuoteClient:
         ).astimezone(timezone.utc)
         return self._token
 
-    async def request(
+    async def _post(
         self,
         path: str,
         api_id: str,
         body: Optional[Dict[str, Any]] = None,
         extra_headers: Optional[Dict[str, str]] = None,
-    ) -> Dict[str, Any]:
-        """공통 API 요청. 응답의 return_code(!=0)는 HTTP 200이어도 실패로 취급한다."""
+    ) -> httpx.Response:
+        """인증 헤더를 붙여 POST 하고, 401이면 토큰을 한 번 재발급해 재시도한다."""
         token = await self._get_access_token()
         headers = {
             "Content-Type": "application/json;charset=UTF-8",
@@ -122,6 +124,17 @@ class KiwoomQuoteClient:
             headers["authorization"] = f"Bearer {token}"
             response = await self._client.post(path, json=body or {}, headers=headers)
 
+        return response
+
+    async def request(
+        self,
+        path: str,
+        api_id: str,
+        body: Optional[Dict[str, Any]] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """공통 API 요청. 응답의 return_code(!=0)는 HTTP 200이어도 실패로 취급한다."""
+        response = await self._post(path, api_id, body, extra_headers)
         data = response.json()
         if response.status_code >= 400 or data.get("return_code") not in (None, 0):
             raise QuoteClientError(
@@ -129,6 +142,43 @@ class KiwoomQuoteClient:
                 f"(status={response.status_code}, return_code={data.get('return_code')})"
             )
         return data
+
+    async def fetch_stock_list(self, mrkt_tp: str) -> List[Dict[str, Any]]:
+        """시장구분별 전체 종목 리스트를 조회한다 (ka10099).
+
+        mrkt_tp: 0=코스피, 10=코스닥, 8=ETF, 3=ELW, 6=리츠 등 (ETF/ETN/리츠/뮤추얼펀드는
+        0/10과 분리된 별도 구분값이라, 0/10만 조회하면 일반 상장기업 종목만 걸러진다).
+        """
+        rows: List[Dict[str, Any]] = []
+        cont_yn: Optional[str] = None
+        next_key: Optional[str] = None
+        while True:
+            extra_headers = {}
+            if cont_yn:
+                extra_headers["cont-yn"] = cont_yn
+            if next_key:
+                extra_headers["next-key"] = next_key
+
+            response = await self._post(
+                QUOTE_PATH,
+                STOCK_LIST_API_ID,
+                {"mrkt_tp": mrkt_tp},
+                extra_headers or None,
+            )
+            data = response.json()
+            if response.status_code >= 400 or data.get("return_code") not in (None, 0):
+                raise QuoteClientError(
+                    f"종목정보 리스트 조회 실패 [mrkt_tp={mrkt_tp}]: {data.get('return_msg')} "
+                    f"(status={response.status_code}, return_code={data.get('return_code')})"
+                )
+            rows.extend(data.get("list", []))
+
+            cont_yn = response.headers.get("cont-yn")
+            next_key = response.headers.get("next-key")
+            if cont_yn != "Y":
+                break
+
+        return rows
 
     async def fetch_quotes(self, symbols: List[str]) -> List[Dict[str, Any]]:
         """종목코드 목록에 대한 현재가/거래량을 순차 조회한다 (ka10001, 1건씩만 지원)."""
