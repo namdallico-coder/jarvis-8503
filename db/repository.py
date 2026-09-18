@@ -155,11 +155,14 @@ def save_decision(conn: sqlite3.Connection, decision: Dict[str, Any]) -> None:
     conn.execute(
         """
         INSERT INTO decisions
-            (stk_cd, decided_at, action, confidence, reason, context_snapshot, model)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (stk_cd, signal_id, signal_type, decided_at, action, confidence, reason,
+             context_snapshot, model)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             decision["stk_cd"],
+            decision["signal_id"],
+            decision["signal_type"],
             decision["decided_at"],
             decision["action"],
             decision["confidence"],
@@ -169,6 +172,45 @@ def save_decision(conn: sqlite3.Connection, decision: Dict[str, Any]) -> None:
         ),
     )
     conn.commit()
+
+
+def get_latest_signals_since(conn: sqlite3.Connection, since_iso: str) -> List[Dict[str, Any]]:
+    """since_iso 이후 발생한 신호 중, 종목별로 가장 최근 것 1건씩만 반환한다.
+
+    decision/main.py가 "신호가 있는 종목만" AI를 호출하도록 이 함수로 대상을 좁힌다.
+    같은 종목에 짧은 시간 안에 여러 크로스가 겹치면(드물지만) 가장 최근 것만 리뷰한다.
+    """
+    cursor = conn.execute(
+        """
+        SELECT s.id, s.stk_cd, s.signal_type, s.short_window_min, s.long_window_min,
+               s.short_ma, s.long_ma, s.price_at_signal, s.detected_at
+        FROM signals s
+        JOIN (
+            SELECT stk_cd, MAX(detected_at) AS max_detected_at
+            FROM signals
+            WHERE detected_at >= ?
+            GROUP BY stk_cd
+        ) latest
+          ON s.stk_cd = latest.stk_cd AND s.detected_at = latest.max_detected_at
+        WHERE s.detected_at >= ?
+        ORDER BY s.stk_cd
+        """,
+        (since_iso, since_iso),
+    )
+    return [
+        {
+            "id": r[0],
+            "stk_cd": r[1],
+            "signal_type": r[2],
+            "short_window_min": r[3],
+            "long_window_min": r[4],
+            "short_ma": r[5],
+            "long_ma": r[6],
+            "price_at_signal": r[7],
+            "detected_at": r[8],
+        }
+        for r in cursor.fetchall()
+    ]
 
 
 def save_signal(conn: sqlite3.Connection, signal: Dict[str, Any]) -> None:

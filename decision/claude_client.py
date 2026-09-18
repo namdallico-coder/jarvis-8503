@@ -8,6 +8,11 @@ JSON 강제 방법: "JSON만 출력해줘" 프롬프트 대신 tool_choice로 �
 tool-use 방식을 쓴다. 모델이 자연어 문장 사이에 JSON을 끼워넣거나 마크다운
 코드펜스를 섞어서 파싱이 깨지는 실패 모드를 원천 차단하고, 성공 시 이미
 구조화된 dict(tool의 input)를 그대로 받는다.
+
+역할: AI가 처음부터 매매 판단을 만들어내지 않는다. signals/가 먼저 계산한
+크로스 신호를 decision/main.py가 넘겨주면, 그 신호를 "따를지(follow) 보류할지
+(hold)"만 검토한다 — 최종 buy/sell/hold는 follow 여부와 신호 방향을 조합해
+decision/main.py가 결정한다.
 """
 
 from __future__ import annotations
@@ -22,13 +27,17 @@ MESSAGES_PATH = "/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MODEL = "claude-sonnet-5"
 
-DECISION_TOOL = {
-    "name": "trading_decision",
-    "description": "주어진 종목 데이터를 바탕으로 매매 판단을 반환한다.",
+SIGNAL_REVIEW_TOOL = {
+    "name": "signal_review",
+    "description": "이동평균 크로스 신호 1건을 검토해 그 신호를 따를지(follow) 보류할지(hold)를 반환한다.",
     "input_schema": {
         "type": "object",
         "properties": {
-            "action": {"type": "string", "enum": ["buy", "sell", "hold"]},
+            "action": {
+                "type": "string",
+                "enum": ["follow", "hold"],
+                "description": "follow: 신호(골든/데드크로스) 방향을 따른다. hold: 신호를 무시하고 보류한다.",
+            },
             "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
             "reason": {"type": "string", "description": "판단 근거 (한국어, 2~3문장)"},
         },
@@ -58,8 +67,8 @@ class ClaudeClient:
     async def close(self) -> None:
         await self._client.aclose()
 
-    async def decide(self, system_prompt: str, user_content: str) -> Dict[str, Any]:
-        """user_content(종목 컨텍스트 JSON 문자열)를 근거로 판단 dict를 받는다."""
+    async def review_signal(self, system_prompt: str, user_content: str) -> Dict[str, Any]:
+        """user_content(신호+컨텍스트 JSON 문자열)를 근거로 follow/hold 판단 dict를 받는다."""
         if not self.api_key:
             raise ClaudeClientError("ANTHROPIC_API_KEY 가 설정되지 않았습니다.")
 
@@ -75,8 +84,8 @@ class ClaudeClient:
                 "max_tokens": 1024,
                 "system": system_prompt,
                 "messages": [{"role": "user", "content": user_content}],
-                "tools": [DECISION_TOOL],
-                "tool_choice": {"type": "tool", "name": "trading_decision"},
+                "tools": [SIGNAL_REVIEW_TOOL],
+                "tool_choice": {"type": "tool", "name": "signal_review"},
             },
         )
         data = response.json()
@@ -88,7 +97,7 @@ class ClaudeClient:
             )
 
         for block in data.get("content", []):
-            if block.get("type") == "tool_use" and block.get("name") == "trading_decision":
+            if block.get("type") == "tool_use" and block.get("name") == "signal_review":
                 return block["input"]
 
         raise ClaudeClientError(f"tool_use 응답을 찾지 못했습니다: {data}")
