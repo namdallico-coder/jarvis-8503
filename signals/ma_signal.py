@@ -34,11 +34,18 @@ class MaSnapshot:
     price_at_signal: int
 
 
-def compute_ma_snapshot(conn: sqlite3.Connection, stk_cd: str) -> Optional[MaSnapshot]:
-    """장기 창 데이터가 min_samples 미만이면(신규 상장/재시작 직후 등) None을 반환한다."""
-    now = datetime.now(timezone.utc)
+def compute_ma_snapshot(
+    conn: sqlite3.Connection, stk_cd: str, as_of: Optional[datetime] = None
+) -> Optional[MaSnapshot]:
+    """장기 창 데이터가 min_samples 미만이면(신규 상장/재시작 직후 등) None을 반환한다.
+
+    as_of를 넘기면 그 시점을 "지금"으로 보고 계산한다 (signals/backtest.py가
+    과거 시점을 재생하며 신호 판정 로직을 그대로 재사용하는 데 쓴다).
+    """
+    now = as_of or datetime.now(timezone.utc)
+    now_iso = now.isoformat()
     long_since = (now - timedelta(minutes=signal_settings.long_window_min)).isoformat()
-    history = get_price_history(conn, stk_cd, long_since)
+    history = get_price_history(conn, stk_cd, long_since, until_iso=now_iso)
     if len(history) < signal_settings.min_samples:
         return None
 

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 DB_DIR = Path(__file__).resolve().parent
 SCHEMA_PATH = DB_DIR / "schema.sql"
@@ -77,16 +77,33 @@ def get_latest_universe(conn: sqlite3.Connection) -> List[Dict[str, str]]:
     return [{"stk_cd": r[0], "stk_nm": r[1]} for r in cursor.fetchall()]
 
 
-def get_price_history(conn: sqlite3.Connection, stk_cd: str, since_iso: str) -> List[Dict[str, Any]]:
-    """since_iso 이후 해당 종목의 시세 이력을 시간순으로 반환한다."""
-    cursor = conn.execute(
-        """
-        SELECT collected_at, cur_prc, trde_qty FROM prices
-        WHERE stk_cd = ? AND collected_at >= ?
-        ORDER BY collected_at ASC
-        """,
-        (stk_cd, since_iso),
-    )
+def get_price_history(
+    conn: sqlite3.Connection, stk_cd: str, since_iso: str, until_iso: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """since_iso 이후(및 until_iso가 있으면 그 이전까지) 해당 종목의 시세 이력을 시간순으로 반환한다.
+
+    until_iso는 signals/backtest.py가 과거 시점을 "지금"으로 놓고 재생할 때, 그 시점
+    이후(미래) 데이터가 창에 섞여 들어가는 걸 막으려고 쓴다. 실시간 사용(until_iso 생략)에는
+    영향이 없다 — 실제 현재 시각 이후의 행은 애초에 존재하지 않기 때문이다.
+    """
+    if until_iso is not None:
+        cursor = conn.execute(
+            """
+            SELECT collected_at, cur_prc, trde_qty FROM prices
+            WHERE stk_cd = ? AND collected_at >= ? AND collected_at <= ?
+            ORDER BY collected_at ASC
+            """,
+            (stk_cd, since_iso, until_iso),
+        )
+    else:
+        cursor = conn.execute(
+            """
+            SELECT collected_at, cur_prc, trde_qty FROM prices
+            WHERE stk_cd = ? AND collected_at >= ?
+            ORDER BY collected_at ASC
+            """,
+            (stk_cd, since_iso),
+        )
     return [
         {"collected_at": r[0], "cur_prc": r[1], "trde_qty": r[2]}
         for r in cursor.fetchall()
