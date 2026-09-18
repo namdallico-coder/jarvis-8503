@@ -1,8 +1,8 @@
 """SQLite 저장소.
 
 collector가 수집한 시세는 prices 테이블에, news가 수집한 DART 공시는
-disclosures 테이블에, decision이 만든 AI 판단은 decisions 테이블에
-적재한다 (db/schema.sql).
+disclosures 테이블에, decision이 만든 AI 판단은 decisions 테이블에,
+signals가 감지한 이동평균 크로스는 signals 테이블에 적재한다 (db/schema.sql).
 """
 
 from __future__ import annotations
@@ -149,6 +149,29 @@ def save_decision(conn: sqlite3.Connection, decision: Dict[str, Any]) -> None:
             decision["reason"],
             decision["context_snapshot"],
             decision.get("model"),
+        ),
+    )
+    conn.commit()
+
+
+def save_signal(conn: sqlite3.Connection, signal: Dict[str, Any]) -> None:
+    """signals/ma_signal.py가 감지한 크로스 1건을 저장한다."""
+    conn.execute(
+        """
+        INSERT INTO signals
+            (stk_cd, signal_type, short_window_min, long_window_min, short_ma, long_ma,
+             price_at_signal, detected_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            signal["stk_cd"],
+            signal["signal_type"],
+            signal["short_window_min"],
+            signal["long_window_min"],
+            signal["short_ma"],
+            signal["long_ma"],
+            signal["price_at_signal"],
+            signal["detected_at"],
         ),
     )
     conn.commit()

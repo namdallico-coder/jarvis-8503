@@ -43,3 +43,20 @@ CREATE TABLE IF NOT EXISTS decisions (
 
 CREATE INDEX IF NOT EXISTS idx_decisions_stk_cd_decided_at
     ON decisions (stk_cd, decided_at);
+
+-- 이동평균 크로스 신호 (signals/ma_signal.py). 크로스가 실제로 발생한 순간만 기록한다
+-- (매 체크마다 쌓지 않음 — signals/main.py가 직전 상/하 관계와 비교해서 뒤집힌 경우만 저장).
+CREATE TABLE IF NOT EXISTS signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stk_cd TEXT NOT NULL,
+    signal_type TEXT NOT NULL,  -- golden_cross | dead_cross
+    short_window_min INTEGER NOT NULL,
+    long_window_min INTEGER NOT NULL,
+    short_ma REAL NOT NULL,
+    long_ma REAL NOT NULL,
+    price_at_signal INTEGER NOT NULL,
+    detected_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_signals_stk_cd_detected_at
+    ON signals (stk_cd, detected_at);

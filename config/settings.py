@@ -35,3 +35,21 @@ class DecisionSettings:
 
 
 decision_settings = DecisionSettings()
+
+
+@dataclass(frozen=True)
+class SignalSettings:
+    # collector 실측 수집 간격이 약 36초(설정 interval_sec=30초 + 30종목 순회 소요시간)라
+    # 그 실측치를 근거로 잡음:
+    #  - 5분 ≈ 샘플 8~9개, 20분 ≈ 샘플 33개 — 일봉 5일/20일 이동평균의 1:4 비율을
+    #    장중 스케일로 그대로 가져옴.
+    #  - 이보다 짧게(예: 1분) 잡으면 30~36초 틱 노이즈에 크로스가 남발되고,
+    #    더 길게 잡으면 장중 세션(6.5시간) 동안 신호가 몇 번 안 떠서
+    #    15분 주기 판단 레이어와 궁합이 나빠짐.
+    short_window_min: int = 5
+    long_window_min: int = 20
+    min_samples: int = 3  # 창 안에 이보다 적으면 아직 판단하기엔 데이터 부족으로 보고 건너뜀
+    check_interval_sec: int = 60  # 1분마다 크로스 여부 확인
+
+
+signal_settings = SignalSettings()
