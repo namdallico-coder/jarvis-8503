@@ -56,8 +56,11 @@ signal_settings = SignalSettings()
 
 @dataclass(frozen=True)
 class RiskGateSettings:
-    # 보수적 기본값 (실제 값은 아직 안 정해짐 — 나중에 조정).
-    max_position_pct: float = 5.0  # 1회 매매 최대 비중 (계좌 총액 대비 %)
+    # 처음엔 1회 최대 5%로 잡았는데, 균등비중 가정(계좌를 max_concurrent_holdings개
+    # 슬롯으로 균등분할)과 모순이었다 — 5종목 동시보유면 슬롯당 20%인데 상한이 5%라
+    # 매수가 항상 거부되는 버그 아닌 버그. max_concurrent_holdings=5 기준
+    # 100/5=20%로 맞춤.
+    max_position_pct: float = 20.0  # 1회 매매 최대 비중 (계좌 총액 대비 %)
     max_concurrent_holdings: int = 5  # 동시 보유 종목 수 제한
     daily_loss_limit_pct: float = -3.0  # 일일 최대 손실 상한 (%, 도달 시 신규 매수 차단)
     max_averaging_count: int = 2  # 동일 종목 물타기(추가매수) 최대 횟수
