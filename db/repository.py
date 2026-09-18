@@ -1,8 +1,10 @@
 """SQLite 저장소.
 
 collector가 수집한 시세는 prices 테이블에, news가 수집한 DART 공시는
-disclosures 테이블에, decision이 만든 AI 판단은 decisions 테이블에,
-signals가 감지한 이동평균 크로스는 signals 테이블에 적재한다 (db/schema.sql).
+disclosures 테이블에, signals가 감지한 이동평균 크로스는 signals 테이블에,
+decision이 만든 AI 판단은 decisions 테이블에, risk_gate의 승인/거부 판정은
+risk_checks 테이블에, risk_gate가 승인한 페이퍼 매매는 paper_trades 테이블에
+적재한다 (db/schema.sql).
 """
 
 from __future__ import annotations
@@ -231,6 +233,94 @@ def save_signal(conn: sqlite3.Connection, signal: Dict[str, Any]) -> None:
             signal["long_ma"],
             signal["price_at_signal"],
             signal["detected_at"],
+        ),
+    )
+    conn.commit()
+
+
+def get_latest_price(conn: sqlite3.Connection, stk_cd: str) -> Optional[int]:
+    row = conn.execute(
+        "SELECT cur_prc FROM prices WHERE stk_cd = ? ORDER BY collected_at DESC LIMIT 1",
+        (stk_cd,),
+    ).fetchone()
+    return row[0] if row else None
+
+
+def get_ungated_decisions(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """buy/sell로 확정됐지만 아직 risk_checks가 없는 decisions를 반환한다.
+
+    risk_gate/main.py가 이 함수로 "아직 안전장치 판정을 안 받은 매매"만 골라온다.
+    hold는 애초에 주문 자체가 없으니 대상이 아니다.
+    """
+    cursor = conn.execute(
+        """
+        SELECT d.id, d.stk_cd, d.action, d.signal_id, d.signal_type, d.confidence, d.reason
+        FROM decisions d
+        WHERE d.action IN ('buy', 'sell')
+          AND NOT EXISTS (SELECT 1 FROM risk_checks r WHERE r.decision_id = d.id)
+        ORDER BY d.id
+        """
+    )
+    return [
+        {
+            "id": r[0],
+            "stk_cd": r[1],
+            "action": r[2],
+            "signal_id": r[3],
+            "signal_type": r[4],
+            "confidence": r[5],
+            "reason": r[6],
+        }
+        for r in cursor.fetchall()
+    ]
+
+
+def save_risk_check(conn: sqlite3.Connection, risk_check: Dict[str, Any]) -> None:
+    """risk_gate/rules.py의 판정 결과(승인/거부 + 하드룰별 근거)를 저장한다."""
+    conn.execute(
+        """
+        INSERT INTO risk_checks (decision_id, stk_cd, action, approved, checks, checked_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            risk_check["decision_id"],
+            risk_check["stk_cd"],
+            risk_check["action"],
+            1 if risk_check["approved"] else 0,
+            risk_check["checks"],
+            risk_check["checked_at"],
+        ),
+    )
+    conn.commit()
+
+
+def get_paper_trades(conn: sqlite3.Connection, stk_cd: str) -> List[Dict[str, Any]]:
+    """해당 종목의 승인된 페이퍼 매매 이력을 시간순으로 반환한다."""
+    cursor = conn.execute(
+        "SELECT action, price, executed_at FROM paper_trades WHERE stk_cd = ? ORDER BY executed_at ASC",
+        (stk_cd,),
+    )
+    return [{"action": r[0], "price": r[1], "executed_at": r[2]} for r in cursor.fetchall()]
+
+
+def get_all_traded_stocks(conn: sqlite3.Connection) -> List[str]:
+    cursor = conn.execute("SELECT DISTINCT stk_cd FROM paper_trades")
+    return [r[0] for r in cursor.fetchall()]
+
+
+def record_paper_trade(conn: sqlite3.Connection, trade: Dict[str, Any]) -> None:
+    """risk_gate가 승인한 buy/sell 1건을 페이퍼 매매 원장에 기록한다."""
+    conn.execute(
+        """
+        INSERT INTO paper_trades (stk_cd, action, price, decision_id, executed_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            trade["stk_cd"],
+            trade["action"],
+            trade["price"],
+            trade["decision_id"],
+            trade["executed_at"],
         ),
     )
     conn.commit()

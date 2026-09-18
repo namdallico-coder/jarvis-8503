@@ -52,3 +52,22 @@ class SignalSettings:
 
 
 signal_settings = SignalSettings()
+
+
+@dataclass(frozen=True)
+class RiskGateSettings:
+    # 보수적 기본값 (실제 값은 아직 안 정해짐 — 나중에 조정).
+    max_position_pct: float = 5.0  # 1회 매매 최대 비중 (계좌 총액 대비 %)
+    max_concurrent_holdings: int = 5  # 동시 보유 종목 수 제한
+    daily_loss_limit_pct: float = -3.0  # 일일 최대 손실 상한 (%, 도달 시 신규 매수 차단)
+    max_averaging_count: int = 2  # 동일 종목 물타기(추가매수) 최대 횟수
+
+    # 아직 실계좌 연동이 없어서 균등비중 가정으로 근사한다: 계좌를
+    # max_concurrent_holdings개 슬롯으로 나눠 각 슬롯이 이 총액의 1/N을 담당한다고 본다.
+    # TODO: 실제 계좌 연동 후 실 잔고로 교체.
+    paper_account_total_value: float = 10_000_000.0  # 페이퍼 계좌 총액 가정치 (원)
+
+    check_interval_sec: int = 60  # decisions에서 미검토 buy/sell 확인 주기
+
+
+risk_gate_settings = RiskGateSettings()
