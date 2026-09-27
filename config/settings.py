@@ -13,6 +13,19 @@ class CollectorSettings:
     interval_sec: int = 30  # 시세 수집 주기(초)
     use_mock: bool = os.getenv("KIWOOM_USE_MOCK", "true").lower() in {"1", "true", "yes"}
 
+    # 키움 API의 일시적 오류에 대한 재시도 정책.
+    # 7  = "서비스를 처리하는 중에 오류가 발생했습니다" — 실측으로 거의 매일
+    #      07:50~08:00 KST경(장 시작 전, 거래일/휴장일 무관 — 키움 쪽 일일 점검으로 추정)
+    #      나타났다가 몇 분 안에 자연 복구되는 걸 확인해서 재시도 대상으로 등록했다.
+    # 5  = "허용된 요청 개수를 초과하였습니다"(HTTP 429, 요청 유량 제한) — 재시도 로직
+    #      검증 중 실제로 재현됨. fetch_quotes의 종목별 딜레이(0.2초=초당 5건)가
+    #      ka10001에서 관측된 유량 한도(초당 5건)와 딱 맞닿아 있어, 지터만 있어도
+    #      정상 운영 중에도 튈 수 있다 — 잠깐 기다리면 풀리는 오류라 재시도 대상.
+    # 다른 일시적 코드가 더 발견되면 여기 추가.
+    transient_retryable_return_codes: frozenset[int] = frozenset({7, 5})
+    transient_retry_interval_sec: int = 30  # 일시 오류 시 재시도 간격
+    transient_retry_timeout_sec: int = 10 * 60  # 이 시간 넘게 계속 실패하면 진짜 문제로 취급
+
 
 settings = CollectorSettings()
 

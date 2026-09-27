@@ -15,11 +15,16 @@ collector/universe.py(순위정보 조회)와 fetch_quotes(시세 조회)가 이
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
 
 import httpx
+
+from config.settings import settings
+from collector.notifications import notify_persistent_failure
 
 KST = timezone(timedelta(hours=9))
 TOKEN_PATH = "/oauth2/token"
@@ -28,9 +33,22 @@ QUOTE_API_ID = "ka10001"  # 주식기본정보요청
 STOCK_LIST_API_ID = "ka10099"  # 종목정보 리스트
 QUOTE_REQUEST_DELAY_SECONDS = 0.2  # 종목별 순차 조회 간 요청 간격
 
+logger = logging.getLogger("collector.kiwoom_client")
+
+T = TypeVar("T")
+
 
 class QuoteClientError(Exception):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        return_code: Optional[int] = None,
+        status_code: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.return_code = return_code
+        self.status_code = status_code
 
 
 class KiwoomQuoteClient:
@@ -59,6 +77,45 @@ class KiwoomQuoteClient:
     async def close(self) -> None:
         await self._client.aclose()
 
+    async def _call_with_retry(self, call: Callable[[], Awaitable[T]], *, label: str) -> T:
+        """call()이 재시도 가능한 QuoteClientError를 던지면 backoff 후 재시도한다.
+
+        재시도 불가능한 에러(인증 실패, 파라미터 오류 등)는 즉시 그대로 올린다.
+        transient_retry_timeout_sec을 넘도록 계속 실패하면 ERROR 로그 + 알림 훅을
+        호출하고 마지막 예외를 그대로 던진다 (systemd Restart=always가 최후 안전망).
+        """
+        start = time.monotonic()
+        attempt = 0
+        while True:
+            try:
+                return await call()
+            except QuoteClientError as exc:
+                if exc.return_code not in settings.transient_retryable_return_codes:
+                    raise
+
+                elapsed = time.monotonic() - start
+                if elapsed >= settings.transient_retry_timeout_sec:
+                    message = (
+                        f"{label}: 키움 API 일시 오류(return_code={exc.return_code})가 "
+                        f"{elapsed:.0f}초 넘게 계속돼 재시도를 포기함: {exc}"
+                    )
+                    logger.error(message)
+                    await notify_persistent_failure(message)
+                    raise
+
+                attempt += 1
+                logger.warning(
+                    "%s: 키움 API 일시 오류(return_code=%s), %d초 뒤 재시도"
+                    " (%d번째 시도, 경과 %.0f초): %s",
+                    label,
+                    exc.return_code,
+                    settings.transient_retry_interval_sec,
+                    attempt,
+                    elapsed,
+                    exc,
+                )
+                await asyncio.sleep(settings.transient_retry_interval_sec)
+
     async def _get_access_token(self, force_refresh: bool = False) -> str:
         if (
             not force_refresh
@@ -67,9 +124,9 @@ class KiwoomQuoteClient:
             and datetime.now(timezone.utc) < self._token_expires_at - timedelta(minutes=10)
         ):
             return self._token
-        return await self._issue_token()
+        return await self._call_with_retry(self._issue_token_once, label="토큰 발급")
 
-    async def _issue_token(self) -> str:
+    async def _issue_token_once(self) -> str:
         if not self.app_key or not self.secret_key:
             raise QuoteClientError("KIWOOM_APP_KEY / KIWOOM_SECRET_KEY 가 설정되지 않았습니다.")
 
@@ -86,7 +143,9 @@ class KiwoomQuoteClient:
         if response.status_code >= 400 or data.get("return_code") not in (None, 0):
             raise QuoteClientError(
                 f"토큰 발급 실패: {data.get('return_msg')} (status={response.status_code}, "
-                f"return_code={data.get('return_code')})"
+                f"return_code={data.get('return_code')})",
+                return_code=data.get("return_code"),
+                status_code=response.status_code,
             )
 
         token = data.get("token")
@@ -133,21 +192,45 @@ class KiwoomQuoteClient:
         body: Optional[Dict[str, Any]] = None,
         extra_headers: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
-        """공통 API 요청. 응답의 return_code(!=0)는 HTTP 200이어도 실패로 취급한다."""
+        """공통 API 요청. 일시 오류(예: return_code=7)는 내부적으로 재시도한다."""
+        return await self._call_with_retry(
+            lambda: self._request_once(path, api_id, body, extra_headers),
+            label=f"request[{api_id}]",
+        )
+
+    async def _request_once(
+        self,
+        path: str,
+        api_id: str,
+        body: Optional[Dict[str, Any]] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """공통 API 요청 1회 시도. 응답의 return_code(!=0)는 HTTP 200이어도 실패로 취급한다."""
         response = await self._post(path, api_id, body, extra_headers)
         data = response.json()
         if response.status_code >= 400 or data.get("return_code") not in (None, 0):
             raise QuoteClientError(
                 f"API 요청 실패 [{api_id}]: {data.get('return_msg')} "
-                f"(status={response.status_code}, return_code={data.get('return_code')})"
+                f"(status={response.status_code}, return_code={data.get('return_code')})",
+                return_code=data.get("return_code"),
+                status_code=response.status_code,
             )
         return data
 
     async def fetch_stock_list(self, mrkt_tp: str) -> List[Dict[str, Any]]:
-        """시장구분별 전체 종목 리스트를 조회한다 (ka10099).
+        """시장구분별 전체 종목 리스트를 조회한다 (ka10099). 일시 오류는 내부적으로 재시도한다.
 
         mrkt_tp: 0=코스피, 10=코스닥, 8=ETF, 3=ELW, 6=리츠 등 (ETF/ETN/리츠/뮤추얼펀드는
         0/10과 분리된 별도 구분값이라, 0/10만 조회하면 일반 상장기업 종목만 걸러진다).
+        """
+        return await self._call_with_retry(
+            lambda: self._fetch_stock_list_once(mrkt_tp),
+            label=f"fetch_stock_list[mrkt_tp={mrkt_tp}]",
+        )
+
+    async def _fetch_stock_list_once(self, mrkt_tp: str) -> List[Dict[str, Any]]:
+        """페이지네이션 전체를 처음부터 끝까지 1회 시도. 중간에 재시도 가능한 오류가 나면
+        전체를 처음부터 다시 받는다 (실측상 ka10099는 한 페이지로 끝나서 비용이 작다).
         """
         rows: List[Dict[str, Any]] = []
         cont_yn: Optional[str] = None
@@ -169,7 +252,9 @@ class KiwoomQuoteClient:
             if response.status_code >= 400 or data.get("return_code") not in (None, 0):
                 raise QuoteClientError(
                     f"종목정보 리스트 조회 실패 [mrkt_tp={mrkt_tp}]: {data.get('return_msg')} "
-                    f"(status={response.status_code}, return_code={data.get('return_code')})"
+                    f"(status={response.status_code}, return_code={data.get('return_code')})",
+                    return_code=data.get("return_code"),
+                    status_code=response.status_code,
                 )
             rows.extend(data.get("list", []))
 
