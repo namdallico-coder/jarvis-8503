@@ -27,12 +27,19 @@ CREATE TABLE IF NOT EXISTS disclosures (
 CREATE INDEX IF NOT EXISTS idx_disclosures_stock_code_rcept_dt
     ON disclosures (stock_code, rcept_dt);
 
--- 이동평균 크로스 신호 (signals/ma_signal.py). 크로스가 실제로 발생한 순간만 기록한다
--- (매 체크마다 쌓지 않음 — signals/main.py가 직전 상/하 관계와 비교해서 뒤집힌 경우만 저장).
+-- 이동평균 크로스 신호 (signals/ma_signal.py). 15분 쿨다운을 통과한 크로스만 기록한다
+-- (signals/ma_signal.py의 decide_recording 참고).
+-- session(regular/extended)으로 정규장 여부만 태그하고 지우지는 않는다 — 장마감 후
+-- 신호도 노이즈가 아니라 NXT 연장거래 등 실제 체결일 수 있어서, 필터링 여부는
+-- 조회 시점에 고르게 한다 (signals/ma_signal.py의 session_for() 참고).
+-- origin(immediate/resync)으로 "방금 뒤집혀서 기록" vs "쿨다운 중 억제된 뒤집힘이
+-- 남아있어서 쿨다운 만료 시 상태를 바로잡으려고 발행" 여부를 구분한다.
 CREATE TABLE IF NOT EXISTS signals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     stk_cd TEXT NOT NULL,
     signal_type TEXT NOT NULL,  -- golden_cross | dead_cross
+    session TEXT NOT NULL,  -- regular | extended
+    origin TEXT NOT NULL,  -- immediate | resync
     short_window_min INTEGER NOT NULL,
     long_window_min INTEGER NOT NULL,
     short_ma REAL NOT NULL,
@@ -43,6 +50,8 @@ CREATE TABLE IF NOT EXISTS signals (
 
 CREATE INDEX IF NOT EXISTS idx_signals_stk_cd_detected_at
     ON signals (stk_cd, detected_at);
+CREATE INDEX IF NOT EXISTS idx_signals_session
+    ON signals (session);
 
 -- AI 판단 로그 (decision/main.py). 페이퍼 모드 — 실제 매매 없이 판단만 기록한다.
 -- signals 테이블에 신호가 뜬 종목만 여기 들어온다 (신호 없으면 AI 호출 자체를 안 함).

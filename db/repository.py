@@ -216,17 +216,20 @@ def get_latest_signals_since(conn: sqlite3.Connection, since_iso: str) -> List[D
 
 
 def save_signal(conn: sqlite3.Connection, signal: Dict[str, Any]) -> None:
-    """signals/ma_signal.py가 감지한 크로스 1건을 저장한다."""
+    """signals/ma_signal.py가 감지한 크로스 1건을 저장한다 (session: regular/extended,
+    origin: immediate/resync)."""
     conn.execute(
         """
         INSERT INTO signals
-            (stk_cd, signal_type, short_window_min, long_window_min, short_ma, long_ma,
-             price_at_signal, detected_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (stk_cd, signal_type, session, origin, short_window_min, long_window_min,
+             short_ma, long_ma, price_at_signal, detected_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             signal["stk_cd"],
             signal["signal_type"],
+            signal["session"],
+            signal["origin"],
             signal["short_window_min"],
             signal["long_window_min"],
             signal["short_ma"],

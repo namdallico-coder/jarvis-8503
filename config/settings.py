@@ -63,6 +63,15 @@ class SignalSettings:
     min_samples: int = 3  # 창 안에 이보다 적으면 아직 판단하기엔 데이터 부족으로 보고 건너뜀
     check_interval_sec: int = 60  # 1분마다 크로스 여부 확인
 
+    # 쿨다운(같은 종목 연속 기록 최소 간격) + 재동기화 정책.
+    # 09/28 백테스트: 쿨다운 없이 하루 250건(정규장만) -> 15분 쿨다운 191건.
+    # 쿨다운만 쓰면 "쿨다운 중 억제된 뒤집힘 이후 다시 안 뒤집히면 DB의 마지막 기록이
+    # 실제 상태와 영영 어긋나는" 위험이 있었음(052690_AL 실측 사례, 7% 종목에서 발생) —
+    # 쿨다운 만료 시 실제 상태와 마지막 기록이 다르면 재동기화 신호를 1건 발행하는
+    # 로직(signals/ma_signal.py의 decide_recording)으로 해결. signals.origin 컬럼에
+    # immediate/resync로 구분 기록.
+    cooldown_min: float = 15.0
+
 
 signal_settings = SignalSettings()
 

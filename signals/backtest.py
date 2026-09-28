@@ -12,25 +12,24 @@ from __future__ import annotations
 
 import statistics
 from collections import defaultdict
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from config.settings import signal_settings
 from db.repository import get_connection, get_latest_universe
-from signals.ma_signal import compute_ma_snapshot, detect_cross
-
-REGULAR_OPEN = dtime(9, 0)
-REGULAR_CLOSE = dtime(15, 30)
+from signals.ma_signal import (
+    CooldownState,
+    IMPLIED_RELATION,
+    Relation,
+    compute_ma_snapshot,
+    decide_recording,
+    detect_cross,
+    session_for,
+)
 
 
 def _parse(iso: str) -> datetime:
     return datetime.fromisoformat(iso)
-
-
-def _is_regular_hours(t: datetime) -> bool:
-    """서버 로컬 타임존(KST) 기준 정규장(09:00~15:30) 여부."""
-    local = t.astimezone()
-    return REGULAR_OPEN <= local.time() <= REGULAR_CLOSE
 
 
 def _stock_time_range(conn, stk_cd: str, since: Optional[datetime], until: Optional[datetime]):
@@ -50,7 +49,7 @@ def _stock_time_range(conn, stk_cd: str, since: Optional[datetime], until: Optio
     return _parse(row[0]), _parse(row[1])
 
 
-def simulate_stock(
+def simulate_stock_detailed(
     conn,
     stk_cd: str,
     *,
@@ -58,17 +57,25 @@ def simulate_stock(
     until: Optional[datetime] = None,
     regular_hours_only: bool = False,
     min_gap_min: Optional[float] = None,
-) -> List[Dict[str, Any]]:
-    """개선안 두 가지를 옵션으로 켤 수 있다 (기본값은 기존 동작과 동일):
+    min_gap_pct: Optional[float] = None,
+) -> Dict[str, Any]:
+    """개선안들을 옵션으로 켤 수 있다 (기본값은 전부 off = 필터 없는 기본 동작):
 
     regular_hours_only: 정규장(09:00~15:30 KST) 밖에서 감지된 신호는 기록하지 않는다.
       (판정에 쓰는 이평 계산 자체는 그대로 — "신호로 기록할지"만 거른다.)
-    min_gap_min: 같은 종목에서 직전 "기록된" 신호로부터 이 분(分) 이상 지나야
-      다음 신호를 기록한다 (그 사이 뒤집힌 것들은 무시 — 상태 추적 자체는 계속함).
+    min_gap_min: signals/ma_signal.py의 decide_recording()을 그대로 써서 쿨다운+재동기화
+      정책을 적용한다 — signals/main.py(실서비스)와 완전히 같은 로직. 이걸 켜면
+      min_gap_pct는 무시된다(실서비스에 쓰는 건 쿨다운뿐이라 조합을 지원 안 함).
+    min_gap_pct: 단기/장기 이평 차이가 현재가 대비 이 %(예: 0.05) 이상일 때만 기록한다
+      (재동기화 없는 단순 크기 필터 — 백테스트 비교 전용, 실서비스엔 안 씀).
+
+    반환: {"crosses": [...], "final_relation": 마지막 실제 관계,
+           "implied_relation": 마지막으로 "기록된" 신호가 주장하는 관계,
+           "consistent": 위 둘이 일치하는지}
     """
     t_min, t_max = _stock_time_range(conn, stk_cd, since, until)
     if t_min is None:
-        return []
+        return {"crosses": [], "final_relation": None, "implied_relation": None, "consistent": True}
     if since is not None and t_min < since:
         t_min = since
     if until is not None and t_max > until:
@@ -76,37 +83,60 @@ def simulate_stock(
 
     step = timedelta(seconds=signal_settings.check_interval_sec)
     crosses: List[Dict[str, Any]] = []
-    prev_relation = None
-    last_recorded_at: Optional[datetime] = None
+    prev_relation: Optional[Relation] = None
+    cooldown_state = CooldownState()
 
     t = t_min
     while t <= t_max:
         snapshot = compute_ma_snapshot(conn, stk_cd, as_of=t)
         if snapshot is not None:
-            signal_type = detect_cross(prev_relation, snapshot)
+            raw_signal_type = detect_cross(prev_relation, snapshot)
+
+            if min_gap_min is not None:
+                result = decide_recording(raw_signal_type, snapshot, cooldown_state, t, min_gap_min)
+                signal_type, origin = result if result else (None, None)
+            else:
+                signal_type, origin = raw_signal_type, "immediate"
+
             if signal_type:
                 record = True
-                if regular_hours_only and not _is_regular_hours(t):
+                if regular_hours_only and session_for(t) != "regular":
                     record = False
-                if record and min_gap_min is not None and last_recorded_at is not None:
-                    gap_min = (t - last_recorded_at).total_seconds() / 60
-                    if gap_min < min_gap_min:
+                if record and min_gap_min is None and min_gap_pct is not None:
+                    gap_pct = abs(snapshot.short_ma - snapshot.long_ma) / snapshot.price_at_signal * 100
+                    if gap_pct < min_gap_pct:
                         record = False
                 if record:
                     crosses.append(
                         {
                             "as_of": t.isoformat(),
                             "signal_type": signal_type,
+                            "origin": origin,
                             "short_ma": snapshot.short_ma,
                             "long_ma": snapshot.long_ma,
                             "price": snapshot.price_at_signal,
                         }
                     )
-                    last_recorded_at = t
+                    if min_gap_min is not None:
+                        cooldown_state.last_recorded_at = t
+                        cooldown_state.last_recorded_relation = snapshot.relation
             prev_relation = snapshot.relation
         t += step
 
-    return crosses
+    implied_relation = IMPLIED_RELATION.get(crosses[-1]["signal_type"]) if crosses else None
+    consistent = implied_relation is None or prev_relation is None or implied_relation == prev_relation
+
+    return {
+        "crosses": crosses,
+        "final_relation": prev_relation,
+        "implied_relation": implied_relation,
+        "consistent": consistent,
+    }
+
+
+def simulate_stock(conn, stk_cd: str, **kwargs) -> List[Dict[str, Any]]:
+    """simulate_stock_detailed()의 crosses만 필요할 때 쓰는 얇은 래퍼."""
+    return simulate_stock_detailed(conn, stk_cd, **kwargs)["crosses"]
 
 
 def main() -> None:

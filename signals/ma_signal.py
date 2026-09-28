@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from statistics import mean
 from typing import Literal, Optional
 
@@ -24,6 +24,21 @@ from config.settings import signal_settings
 from db.repository import get_price_history
 
 Relation = Literal["above", "below", "equal"]
+Session = Literal["regular", "extended"]
+
+REGULAR_OPEN = dtime(9, 0)
+REGULAR_CLOSE = dtime(15, 30)
+
+
+def session_for(dt: datetime) -> Session:
+    """서버 로컬 타임존(KST) 기준 정규장(09:00~15:30)이면 'regular', 아니면 'extended'.
+
+    'extended'는 노이즈가 아니라 장 전 예비호가나 NXT 연장거래 등 실제 체결도 포함한다
+    (signals/backtest.py 09/28 검증: 장마감 후 신호의 거래량이 실제로 계속 누적됨).
+    삭제하지 않고 태그만 남겨서 나중에 필터링 여부를 고를 수 있게 한다.
+    """
+    local = dt.astimezone()
+    return "regular" if REGULAR_OPEN <= local.time() <= REGULAR_CLOSE else "extended"
 
 
 @dataclass
@@ -80,3 +95,55 @@ def detect_cross(prev_relation: Optional[Relation], snapshot: MaSnapshot) -> Opt
     if prev_relation == snapshot.relation:
         return None
     return "golden_cross" if snapshot.relation == "above" else "dead_cross"
+
+
+Origin = Literal["immediate", "resync"]
+
+# signal_type -> 그 신호가 "기록되고 나면" 맞다고 주장하는 관계.
+IMPLIED_RELATION = {"golden_cross": "above", "dead_cross": "below"}
+
+
+@dataclass
+class CooldownState:
+    """종목 1개의 쿨다운 상태. signals/main.py와 signals/backtest.py가 종목별로 하나씩 들고 있는다."""
+
+    last_recorded_at: Optional[datetime] = None
+    last_recorded_relation: Optional[Relation] = None
+
+
+def decide_recording(
+    raw_signal_type: Optional[str],
+    snapshot: MaSnapshot,
+    state: CooldownState,
+    now: datetime,
+    cooldown_min: float,
+) -> Optional[tuple[str, Origin]]:
+    """쿨다운+재동기화 정책. (signal_type, origin) 또는 기록 안 하면 None을 반환한다.
+
+    - 쿨다운(마지막 "기록" 이후 cooldown_min분 이내)이면 무조건 기록 안 함 — 그 사이
+      뒤집힌 것들은 상태 추적(last_relation)만 되고 로그에는 안 남는다.
+    - 쿨다운이 지난 시점에 막 뒤집힌 거면 즉시(immediate) 기록.
+    - 막 뒤집힌 건 아니지만(쿨다운 중 억제된 뒤집힘 때문에) 마지막 "기록된" 관계와
+      지금 실제 관계가 다르면, 그 시점에 재동기화(resync) 신호를 1건 발행해서
+      DB가 실제 상태를 계속 정확히 반영하게 한다 — "쿨다운 만료 후에도 영영
+      재동기화가 안 되는" 문제(직전 대화에서 확인한 052690_AL 사례)를 막는다.
+
+    호출한 쪽은 반환값이 있으면 state.last_recorded_at/last_recorded_relation을
+    갱신해야 한다 (이 함수는 조회만 하고 상태를 바꾸지 않는다).
+    """
+    cooldown_active = (
+        state.last_recorded_at is not None
+        and (now - state.last_recorded_at).total_seconds() / 60 < cooldown_min
+    )
+    if cooldown_active:
+        return None
+
+    if raw_signal_type is not None:
+        return raw_signal_type, "immediate"
+
+    implied = state.last_recorded_relation
+    if implied is not None and snapshot.relation != "equal" and snapshot.relation != implied:
+        resync_type = "golden_cross" if snapshot.relation == "above" else "dead_cross"
+        return resync_type, "resync"
+
+    return None
