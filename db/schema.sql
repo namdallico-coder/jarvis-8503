@@ -34,6 +34,9 @@ CREATE INDEX IF NOT EXISTS idx_disclosures_stock_code_rcept_dt
 -- 조회 시점에 고르게 한다 (signals/ma_signal.py의 session_for() 참고).
 -- origin(immediate/resync)으로 "방금 뒤집혀서 기록" vs "쿨다운 중 억제된 뒤집힘이
 -- 남아있어서 쿨다운 만료 시 상태를 바로잡으려고 발행" 여부를 구분한다.
+-- crossed_at: 이평 관계가 "실제로" 바뀐 시각. immediate는 detected_at과 같고,
+-- resync는 그보다 이를 수 있다(그 차이가 발행 지연). equal을 거쳐 조용히 넘어간
+-- 경우도 CooldownState.relation_since가 그 시점을 그대로 잡아낸다.
 CREATE TABLE IF NOT EXISTS signals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     stk_cd TEXT NOT NULL,
@@ -45,6 +48,7 @@ CREATE TABLE IF NOT EXISTS signals (
     short_ma REAL NOT NULL,
     long_ma REAL NOT NULL,
     price_at_signal INTEGER NOT NULL,
+    crossed_at TEXT NOT NULL,
     detected_at TEXT NOT NULL
 );
 

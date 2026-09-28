@@ -6,10 +6,10 @@ collector가 채운 prices 테이블에서 유니버스 종목별 단기/장기 
 쿨다운(config.signal_settings.cooldown_min, 기본 15분) + 재동기화 정책을 쓴다:
 같은 종목이 쿨다운 안에서 여러 번 뒤집혀도 마지막 "기록" 후 쿨다운이 지나야
 다음 신호를 기록하고(origin=immediate), 쿨다운이 지난 시점에 실제 상태가
-마지막 기록과 다르면(쿨다운 중 억제된 뒤집힘이 남아있던 경우) 그 시점 상태로
-재동기화 신호를 1건 발행한다(origin=resync) — signals/backtest.py로 검증:
-쿨다운만 쓰면 종목의 7%에서 "DB의 마지막 신호"가 실제 상태와 영영 어긋나는
-문제가 있었는데, 재동기화로 이 불일치가 0%가 됨을 확인했다.
+마지막 기록과 다르면(쿨다운 중 억제된 뒤집힘이 남아있던 경우, 또는 equal을 거쳐
+조용히 전환된 경우) 그 시점 상태로 재동기화 신호를 1건 발행한다(origin=resync).
+crossed_at 컬럼에 "실제로 전환된 시각"을 남겨서, resync의 발행 지연(crossed_at ->
+detected_at)을 나중에 계산할 수 있게 한다.
 
 정규장 여부는 걸러내지 않고 session(regular/extended) 컬럼으로 태그만 한다 —
 장마감 후 신호도 노이즈가 아니라 NXT 연장거래 등 실제 체결일 수 있어서다.
@@ -30,7 +30,6 @@ from config.settings import signal_settings
 from db.repository import get_connection, init_db, get_latest_universe, save_signal
 from signals.ma_signal import (
     CooldownState,
-    Relation,
     compute_ma_snapshot,
     decide_recording,
     detect_cross,
@@ -40,11 +39,7 @@ from signals.ma_signal import (
 logger = logging.getLogger("signals")
 
 
-def check_once(
-    conn: sqlite3.Connection,
-    last_relation: Dict[str, Relation],
-    cooldown_state: Dict[str, CooldownState],
-) -> int:
+def check_once(conn: sqlite3.Connection, state_by_stock: Dict[str, CooldownState]) -> int:
     universe = get_latest_universe(conn)
     if not universe:
         logger.warning("universe가 비어있습니다 (collector를 먼저 실행해야 합니다)")
@@ -57,15 +52,15 @@ def check_once(
         if snapshot is None:
             continue
 
-        raw_signal_type = detect_cross(last_relation.get(stk_cd), snapshot)
-        last_relation[stk_cd] = snapshot.relation  # 쿨다운과 무관하게 항상 진짜 상태 추적
+        state = state_by_stock.setdefault(stk_cd, CooldownState())
+        raw_signal_type = detect_cross(state.current_relation, snapshot)
 
-        state = cooldown_state.setdefault(stk_cd, CooldownState())
         now = datetime.now(timezone.utc)
-        result = decide_recording(raw_signal_type, snapshot, state, now, signal_settings.cooldown_min)
+        state.update_relation(snapshot, now)  # relation_since 갱신 (equal 경유 포함)
 
+        result = decide_recording(raw_signal_type, snapshot, state, now, signal_settings.cooldown_min)
         if result:
-            signal_type, origin = result
+            signal_type, origin, crossed_at = result
             state.last_recorded_at = now
             state.last_recorded_relation = snapshot.relation
 
@@ -81,18 +76,21 @@ def check_once(
                     "short_ma": snapshot.short_ma,
                     "long_ma": snapshot.long_ma,
                     "price_at_signal": snapshot.price_at_signal,
+                    "crossed_at": crossed_at.isoformat(),
                     "detected_at": now.isoformat(),
                 },
             )
             new_signals += 1
+            delay_sec = (now - crossed_at).total_seconds()
             logger.info(
-                "%s: %s [%s] (단기 %.0f / 장기 %.0f, 현재가 %d)",
+                "%s: %s [%s] (단기 %.0f / 장기 %.0f, 현재가 %d, 발행지연 %.0f초)",
                 stk_cd,
                 signal_type,
                 origin,
                 snapshot.short_ma,
                 snapshot.long_ma,
                 snapshot.price_at_signal,
+                delay_sec,
             )
 
     return new_signals
@@ -104,11 +102,10 @@ async def run() -> None:
     conn = get_connection()
     init_db(conn)
 
-    last_relation: Dict[str, Relation] = {}
-    cooldown_state: Dict[str, CooldownState] = {}
+    state_by_stock: Dict[str, CooldownState] = {}
     try:
         while True:
-            new_signals = check_once(conn, last_relation, cooldown_state)
+            new_signals = check_once(conn, state_by_stock)
             logger.info("signal check done: %d new", new_signals)
             await asyncio.sleep(signal_settings.check_interval_sec)
     finally:

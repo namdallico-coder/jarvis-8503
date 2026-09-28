@@ -20,7 +20,6 @@ from db.repository import get_connection, get_latest_universe
 from signals.ma_signal import (
     CooldownState,
     IMPLIED_RELATION,
-    Relation,
     compute_ma_snapshot,
     decide_recording,
     detect_cross,
@@ -83,20 +82,20 @@ def simulate_stock_detailed(
 
     step = timedelta(seconds=signal_settings.check_interval_sec)
     crosses: List[Dict[str, Any]] = []
-    prev_relation: Optional[Relation] = None
-    cooldown_state = CooldownState()
+    state = CooldownState()
 
     t = t_min
     while t <= t_max:
         snapshot = compute_ma_snapshot(conn, stk_cd, as_of=t)
         if snapshot is not None:
-            raw_signal_type = detect_cross(prev_relation, snapshot)
+            raw_signal_type = detect_cross(state.current_relation, snapshot)
+            state.update_relation(snapshot, t)  # relation_since 갱신 (equal 경유 포함)
 
             if min_gap_min is not None:
-                result = decide_recording(raw_signal_type, snapshot, cooldown_state, t, min_gap_min)
-                signal_type, origin = result if result else (None, None)
+                result = decide_recording(raw_signal_type, snapshot, state, t, min_gap_min)
+                signal_type, origin, crossed_at = result if result else (None, None, None)
             else:
-                signal_type, origin = raw_signal_type, "immediate"
+                signal_type, origin, crossed_at = raw_signal_type, "immediate", t
 
             if signal_type:
                 record = True
@@ -112,23 +111,25 @@ def simulate_stock_detailed(
                             "as_of": t.isoformat(),
                             "signal_type": signal_type,
                             "origin": origin,
+                            "crossed_at": crossed_at.isoformat(),
+                            "delay_min": (t - crossed_at).total_seconds() / 60,
                             "short_ma": snapshot.short_ma,
                             "long_ma": snapshot.long_ma,
                             "price": snapshot.price_at_signal,
                         }
                     )
                     if min_gap_min is not None:
-                        cooldown_state.last_recorded_at = t
-                        cooldown_state.last_recorded_relation = snapshot.relation
-            prev_relation = snapshot.relation
+                        state.last_recorded_at = t
+                        state.last_recorded_relation = snapshot.relation
         t += step
 
+    final_relation = state.current_relation
     implied_relation = IMPLIED_RELATION.get(crosses[-1]["signal_type"]) if crosses else None
-    consistent = implied_relation is None or prev_relation is None or implied_relation == prev_relation
+    consistent = implied_relation is None or final_relation is None or implied_relation == final_relation
 
     return {
         "crosses": crosses,
-        "final_relation": prev_relation,
+        "final_relation": final_relation,
         "implied_relation": implied_relation,
         "consistent": consistent,
     }
