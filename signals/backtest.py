@@ -12,36 +12,72 @@ from __future__ import annotations
 
 import statistics
 from collections import defaultdict
-from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from datetime import datetime, time as dtime, timedelta
+from typing import Any, Dict, List, Optional
 
 from config.settings import signal_settings
 from db.repository import get_connection, get_latest_universe
 from signals.ma_signal import compute_ma_snapshot, detect_cross
+
+REGULAR_OPEN = dtime(9, 0)
+REGULAR_CLOSE = dtime(15, 30)
 
 
 def _parse(iso: str) -> datetime:
     return datetime.fromisoformat(iso)
 
 
-def _stock_time_range(conn, stk_cd: str):
-    row = conn.execute(
-        "SELECT MIN(collected_at), MAX(collected_at) FROM prices WHERE stk_cd = ?",
-        (stk_cd,),
-    ).fetchone()
+def _is_regular_hours(t: datetime) -> bool:
+    """서버 로컬 타임존(KST) 기준 정규장(09:00~15:30) 여부."""
+    local = t.astimezone()
+    return REGULAR_OPEN <= local.time() <= REGULAR_CLOSE
+
+
+def _stock_time_range(conn, stk_cd: str, since: Optional[datetime], until: Optional[datetime]):
+    if since is not None and until is not None:
+        row = conn.execute(
+            "SELECT MIN(collected_at), MAX(collected_at) FROM prices "
+            "WHERE stk_cd = ? AND collected_at >= ? AND collected_at <= ?",
+            (stk_cd, since.isoformat(), until.isoformat()),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT MIN(collected_at), MAX(collected_at) FROM prices WHERE stk_cd = ?",
+            (stk_cd,),
+        ).fetchone()
     if not row or row[0] is None:
         return None, None
     return _parse(row[0]), _parse(row[1])
 
 
-def simulate_stock(conn, stk_cd: str) -> List[Dict[str, Any]]:
-    t_min, t_max = _stock_time_range(conn, stk_cd)
+def simulate_stock(
+    conn,
+    stk_cd: str,
+    *,
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+    regular_hours_only: bool = False,
+    min_gap_min: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """개선안 두 가지를 옵션으로 켤 수 있다 (기본값은 기존 동작과 동일):
+
+    regular_hours_only: 정규장(09:00~15:30 KST) 밖에서 감지된 신호는 기록하지 않는다.
+      (판정에 쓰는 이평 계산 자체는 그대로 — "신호로 기록할지"만 거른다.)
+    min_gap_min: 같은 종목에서 직전 "기록된" 신호로부터 이 분(分) 이상 지나야
+      다음 신호를 기록한다 (그 사이 뒤집힌 것들은 무시 — 상태 추적 자체는 계속함).
+    """
+    t_min, t_max = _stock_time_range(conn, stk_cd, since, until)
     if t_min is None:
         return []
+    if since is not None and t_min < since:
+        t_min = since
+    if until is not None and t_max > until:
+        t_max = until
 
     step = timedelta(seconds=signal_settings.check_interval_sec)
     crosses: List[Dict[str, Any]] = []
     prev_relation = None
+    last_recorded_at: Optional[datetime] = None
 
     t = t_min
     while t <= t_max:
@@ -49,15 +85,24 @@ def simulate_stock(conn, stk_cd: str) -> List[Dict[str, Any]]:
         if snapshot is not None:
             signal_type = detect_cross(prev_relation, snapshot)
             if signal_type:
-                crosses.append(
-                    {
-                        "as_of": t.isoformat(),
-                        "signal_type": signal_type,
-                        "short_ma": snapshot.short_ma,
-                        "long_ma": snapshot.long_ma,
-                        "price": snapshot.price_at_signal,
-                    }
-                )
+                record = True
+                if regular_hours_only and not _is_regular_hours(t):
+                    record = False
+                if record and min_gap_min is not None and last_recorded_at is not None:
+                    gap_min = (t - last_recorded_at).total_seconds() / 60
+                    if gap_min < min_gap_min:
+                        record = False
+                if record:
+                    crosses.append(
+                        {
+                            "as_of": t.isoformat(),
+                            "signal_type": signal_type,
+                            "short_ma": snapshot.short_ma,
+                            "long_ma": snapshot.long_ma,
+                            "price": snapshot.price_at_signal,
+                        }
+                    )
+                    last_recorded_at = t
             prev_relation = snapshot.relation
         t += step
 
