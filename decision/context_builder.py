@@ -34,16 +34,24 @@ def _downsample(rows: List[Dict[str, Any]], n: int) -> List[Dict[str, Any]]:
 
 
 def build_context(
-    conn: sqlite3.Connection, stk_cd: str, stk_nm: str, signal: Dict[str, Any]
+    conn: sqlite3.Connection,
+    stk_cd: str,
+    stk_nm: str,
+    signal: Dict[str, Any],
+    as_of: datetime | None = None,
 ) -> Dict[str, Any]:
-    """signal(get_latest_signals_since()가 준 신호 1건)을 리뷰하는 데 필요한 컨텍스트를 만든다."""
-    since = (
-        datetime.now(timezone.utc) - timedelta(hours=decision_settings.price_lookback_hours)
-    ).isoformat()
-    price_rows = get_price_history(conn, stk_cd, since)
+    """signal(get_latest_signals_since()가 준 신호 1건)을 리뷰하는 데 필요한 컨텍스트를 만든다.
+
+    as_of를 넘기면 "최근 1시간"을 실제 현재 시각이 아니라 그 시점 기준으로 계산한다
+    (옛 신호를 다시 리뷰할 때, 실행 시점의 장마감 후 정체 데이터가 안 섞이게 하려고 씀 —
+    실시간 운영에서는 항상 생략하고 실제 지금을 쓴다).
+    """
+    now = as_of or datetime.now(timezone.utc)
+    since = (now - timedelta(hours=decision_settings.price_lookback_hours)).isoformat()
+    price_rows = get_price_history(conn, stk_cd, since, until_iso=now.isoformat())
     price_history = _downsample(price_rows, PRICE_SAMPLE_POINTS)
 
-    today = datetime.now().strftime("%Y%m%d")  # 서버 로컬 타임존(KST) 기준
+    today = now.astimezone().strftime("%Y%m%d")  # 서버 로컬 타임존(KST) 기준
     disclosures_today = get_todays_disclosures(conn, _strip_exchange_suffix(stk_cd), today)
 
     return {

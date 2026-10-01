@@ -27,6 +27,23 @@ MESSAGES_PATH = "/v1/messages"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MODEL = "claude-sonnet-5"
 
+# $/1M 토큰 (input, output). 2026-09 기준. 모델 바뀌면 같이 갱신 필요.
+PRICING_PER_MTOK = {
+    "claude-sonnet-5": (2.00, 10.00),
+}
+
+
+def estimate_cost_usd(model: str, usage: Dict[str, Any]) -> Optional[float]:
+    """usage(response.usage)와 모델명으로 호출 1건의 비용을 추정한다. 가격표에 없는
+    모델이면 None (추측해서 잘못된 비용을 보여주는 것보다 모른다고 하는 게 낫다)."""
+    pricing = PRICING_PER_MTOK.get(model)
+    if pricing is None:
+        return None
+    input_rate, output_rate = pricing
+    input_tokens = usage.get("input_tokens", 0)
+    output_tokens = usage.get("output_tokens", 0)
+    return (input_tokens * input_rate + output_tokens * output_rate) / 1_000_000
+
 SIGNAL_REVIEW_TOOL = {
     "name": "signal_review",
     "description": "이동평균 크로스 신호 1건을 검토해 그 신호를 따를지(follow) 보류할지(hold)를 반환한다.",
@@ -63,6 +80,7 @@ class ClaudeClient:
         # or 체인으로 한 번 더 감싼다.
         self.model = model or os.getenv("CLAUDE_DECISION_MODEL") or DEFAULT_MODEL
         self._client = httpx.AsyncClient(base_url=BASE_URL, timeout=httpx.Timeout(timeout))
+        self.last_usage: Optional[Dict[str, Any]] = None  # 마지막 호출의 response.usage
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -95,6 +113,8 @@ class ClaudeClient:
                 f"Claude API 요청 실패: {error.get('message')} "
                 f"(status={response.status_code}, type={error.get('type')})"
             )
+
+        self.last_usage = data.get("usage")
 
         for block in data.get("content", []):
             if block.get("type") == "tool_use" and block.get("name") == "signal_review":

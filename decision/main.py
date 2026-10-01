@@ -77,8 +77,11 @@ async def review_one(
     stk_cd: str,
     stk_nm: str,
     signal: Dict[str, Any],
+    as_of: datetime | None = None,
 ) -> None:
-    context = build_context(conn, stk_cd, stk_nm, signal)
+    """as_of: 옛 신호를 재검토할 때 "최근 1시간"을 그 시점 기준으로 계산하려고 쓴다
+    (실시간 운영에서는 생략 — build_context()와 동일한 용도)."""
+    context = build_context(conn, stk_cd, stk_nm, signal, as_of=as_of)
     user_content = json.dumps(context, ensure_ascii=False, indent=2)
 
     try:
