@@ -35,6 +35,8 @@ class NewsSettings:
     disclosure_check_interval_sec: int = 300  # 5분마다 신규 공시 확인
     corp_code_refresh_interval_sec: int = 24 * 60 * 60  # 고유번호 매핑 24시간마다 갱신
     request_delay_sec: float = 0.2  # 종목별 순차 조회 간 요청 간격
+    backoff_initial_sec: int = 30  # DART 장애/점검(status 800 등) 시 첫 재시도 대기
+    backoff_max_sec: int = 30 * 60  # 지수 백오프 상한 (30분)
 
 
 news_settings = NewsSettings()
