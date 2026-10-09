@@ -3,8 +3,11 @@
 signals 테이블에서 넘어온 크로스 신호 1건을 중심으로, prices/disclosures에서
 최근 시세 흐름과 오늘자 신규 공시를 모아 Claude에게 넘길 구조화 데이터를 만든다.
 
-보유 상태는 아직 계좌 연동 컴포넌트가 없어 전부 미보유로 고정한다.
-TODO: 계좌 연동 후 실제 보유수량/평단가/수익률로 교체.
+보유 상태(holding)는 실계좌 연동 전까지 risk_gate가 승인한 매매만 담는 paper_trades
+원장에서 가져온다(risk_gate/portfolio.py의 get_holding_state — risk_gate가 판정할 때 보는
+보유/평단가/물타기 횟수와 같은 함수를 쓴다). 이전엔 전부 미보유로 고정이라, 실제 보유
+종목의 dead_cross를 AI가 "미보유라 매도 근거 없다"며 보류하는 왜곡이 있었다.
+TODO: 실계좌 연동 후 이 부분을 진짜 잔고 조회로 교체.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from typing import Any, Dict, List
 
 from config.settings import decision_settings
 from db.repository import get_price_history, get_todays_disclosures
+from risk_gate.portfolio import get_holding_state
 
 PRICE_SAMPLE_POINTS = 12  # 1시간치를 대략 5분 간격 수준으로 압축해서 프롬프트에 싣는다
 
@@ -68,5 +72,5 @@ def build_context(
         },
         "price_history_1h": price_history,
         "disclosures_today": disclosures_today,
-        "holding": {"held": False},
+        "holding": get_holding_state(conn, stk_cd, as_of=as_of),
     }

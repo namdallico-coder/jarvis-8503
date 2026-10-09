@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from db.repository import get_all_traded_stocks, get_latest_price, get_paper_trades
@@ -20,6 +20,12 @@ from db.repository import get_all_traded_stocks, get_latest_price, get_paper_tra
 def _local_date(iso_str: str) -> str:
     """UTC-aware ISO 문자열을 서버 로컬 타임존(KST) 기준 YYYYMMDD로 변환한다."""
     return datetime.fromisoformat(iso_str).astimezone().strftime("%Y%m%d")
+
+
+def _trades(conn: sqlite3.Connection, stk_cd: str, as_of: Optional[datetime]) -> List[Dict[str, Any]]:
+    """as_of가 있으면 그 시점까지의 체결만 본다. 원장의 executed_at이 UTC ISO라 UTC로 맞춰 비교한다."""
+    until_iso = as_of.astimezone(timezone.utc).isoformat() if as_of is not None else None
+    return get_paper_trades(conn, stk_cd, until_iso=until_iso)
 
 
 def _open_buys_since_last_sell(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -32,8 +38,8 @@ def _open_buys_since_last_sell(trades: List[Dict[str, Any]]) -> List[Dict[str, A
     return [t for t in open_trades if t["action"] == "buy"]
 
 
-def is_held(conn: sqlite3.Connection, stk_cd: str) -> bool:
-    trades = get_paper_trades(conn, stk_cd)
+def is_held(conn: sqlite3.Connection, stk_cd: str, as_of: Optional[datetime] = None) -> bool:
+    trades = _trades(conn, stk_cd, as_of)
     return bool(trades) and trades[-1]["action"] == "buy"
 
 
@@ -42,19 +48,32 @@ def get_open_position_count(conn: sqlite3.Connection) -> int:
     return sum(1 for stk_cd in get_all_traded_stocks(conn) if is_held(conn, stk_cd))
 
 
-def get_averaging_count(conn: sqlite3.Connection, stk_cd: str) -> int:
+def get_averaging_count(conn: sqlite3.Connection, stk_cd: str, as_of: Optional[datetime] = None) -> int:
     """현재 포지션을 연 이후 추가로 매수한 횟수(첫 매수=진입, 물타기 아님)."""
-    open_buys = _open_buys_since_last_sell(get_paper_trades(conn, stk_cd))
+    open_buys = _open_buys_since_last_sell(_trades(conn, stk_cd, as_of))
     return max(0, len(open_buys) - 1)
 
 
-def get_entry_price(conn: sqlite3.Connection, stk_cd: str) -> Optional[float]:
+def get_entry_price(conn: sqlite3.Connection, stk_cd: str, as_of: Optional[datetime] = None) -> Optional[float]:
     """현재 열려 있는 포지션의 평단가(진입 이후 매수들의 단순평균)."""
-    open_buys = _open_buys_since_last_sell(get_paper_trades(conn, stk_cd))
+    open_buys = _open_buys_since_last_sell(_trades(conn, stk_cd, as_of))
     if not open_buys:
         return None
     prices = [t["price"] for t in open_buys]
     return sum(prices) / len(prices)
+
+
+def get_holding_state(conn: sqlite3.Connection, stk_cd: str, as_of: Optional[datetime] = None) -> Dict[str, Any]:
+    """decision의 AI 컨텍스트에 넣을 보유 상태. 위 세 함수를 그대로 조합해서, risk_gate가
+    보는 "보유/평단가/물타기 횟수"와 AI가 보는 값이 어긋날 수 없게 한다."""
+    if not is_held(conn, stk_cd, as_of):
+        return {"held": False}
+    entry_price = get_entry_price(conn, stk_cd, as_of)
+    return {
+        "held": True,
+        "entry_price": round(entry_price, 2) if entry_price is not None else None,
+        "averaging_count": get_averaging_count(conn, stk_cd, as_of),
+    }
 
 
 def _reconstruct_cycles(trades: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Optional[float]]:

@@ -176,28 +176,36 @@ def save_decision(conn: sqlite3.Connection, decision: Dict[str, Any]) -> None:
     conn.commit()
 
 
-def get_latest_signals_since(conn: sqlite3.Connection, since_iso: str) -> List[Dict[str, Any]]:
+def get_latest_signals_since(
+    conn: sqlite3.Connection, since_iso: str, session: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """since_iso 이후 발생한 신호 중, 종목별로 가장 최근 것 1건씩만 반환한다.
+
+    session을 주면(regular/extended) 그 세션 신호만 대상으로 "종목별 최근 1건"을 고른다 —
+    장외 신호가 같은 창 안의 정규장 신호를 가리지 않게 하려고 SQL 단계에서 거른다.
 
     decision/main.py가 "신호가 있는 종목만" AI를 호출하도록 이 함수로 대상을 좁힌다.
     같은 종목에 짧은 시간 안에 여러 크로스가 겹치면(드물지만) 가장 최근 것만 리뷰한다.
     """
+    session_clause = "AND session = ?" if session else ""
+    session_clause_outer = "AND s.session = ?" if session else ""
+    extra = (session,) if session else ()
     cursor = conn.execute(
-        """
+        f"""
         SELECT s.id, s.stk_cd, s.signal_type, s.short_window_min, s.long_window_min,
-               s.short_ma, s.long_ma, s.price_at_signal, s.detected_at
+               s.short_ma, s.long_ma, s.price_at_signal, s.detected_at, s.session
         FROM signals s
         JOIN (
             SELECT stk_cd, MAX(detected_at) AS max_detected_at
             FROM signals
-            WHERE detected_at >= ?
+            WHERE detected_at >= ? {session_clause}
             GROUP BY stk_cd
         ) latest
           ON s.stk_cd = latest.stk_cd AND s.detected_at = latest.max_detected_at
-        WHERE s.detected_at >= ?
+        WHERE s.detected_at >= ? {session_clause_outer}
         ORDER BY s.stk_cd
         """,
-        (since_iso, since_iso),
+        (since_iso, *extra, since_iso, *extra),
     )
     return [
         {
@@ -210,6 +218,7 @@ def get_latest_signals_since(conn: sqlite3.Connection, since_iso: str) -> List[D
             "long_ma": r[6],
             "price_at_signal": r[7],
             "detected_at": r[8],
+            "session": r[9],
         }
         for r in cursor.fetchall()
     ]
@@ -298,13 +307,38 @@ def save_risk_check(conn: sqlite3.Connection, risk_check: Dict[str, Any]) -> Non
     conn.commit()
 
 
-def get_paper_trades(conn: sqlite3.Connection, stk_cd: str) -> List[Dict[str, Any]]:
-    """해당 종목의 승인된 페이퍼 매매 이력을 시간순으로 반환한다."""
-    cursor = conn.execute(
-        "SELECT action, price, executed_at FROM paper_trades WHERE stk_cd = ? ORDER BY executed_at ASC",
-        (stk_cd,),
-    )
+def get_paper_trades(
+    conn: sqlite3.Connection, stk_cd: str, until_iso: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """해당 종목의 승인된 페이퍼 매매 이력을 시간순으로 반환한다.
+
+    until_iso(UTC ISO)를 주면 그 시각까지 체결된 것만 본다 — 옛 신호를 재검토할 때
+    "그 시점에 보유 중이었는지"를 재구성하려고 쓴다 (생략하면 전체 이력).
+    """
+    if until_iso is not None:
+        cursor = conn.execute(
+            "SELECT action, price, executed_at FROM paper_trades "
+            "WHERE stk_cd = ? AND executed_at <= ? ORDER BY executed_at ASC",
+            (stk_cd, until_iso),
+        )
+    else:
+        cursor = conn.execute(
+            "SELECT action, price, executed_at FROM paper_trades WHERE stk_cd = ? ORDER BY executed_at ASC",
+            (stk_cd,),
+        )
     return [{"action": r[0], "price": r[1], "executed_at": r[2]} for r in cursor.fetchall()]
+
+
+def get_reviewed_signal_ids(conn: sqlite3.Connection, signal_ids: List[int]) -> set:
+    """signal_ids 중 이미 decisions에 리뷰 기록이 있는 신호 id 집합을 반환한다."""
+    if not signal_ids:
+        return set()
+    placeholders = ",".join("?" for _ in signal_ids)
+    cursor = conn.execute(
+        f"SELECT DISTINCT signal_id FROM decisions WHERE signal_id IN ({placeholders})",
+        signal_ids,
+    )
+    return {r[0] for r in cursor.fetchall()}
 
 
 def get_all_traded_stocks(conn: sqlite3.Connection) -> List[str]:
