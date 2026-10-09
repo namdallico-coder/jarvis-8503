@@ -193,7 +193,8 @@ def get_latest_signals_since(
     cursor = conn.execute(
         f"""
         SELECT s.id, s.stk_cd, s.signal_type, s.short_window_min, s.long_window_min,
-               s.short_ma, s.long_ma, s.price_at_signal, s.detected_at, s.session
+               s.short_ma, s.long_ma, s.price_at_signal, s.detected_at, s.session,
+               s.origin, s.crossed_at
         FROM signals s
         JOIN (
             SELECT stk_cd, MAX(detected_at) AS max_detected_at
@@ -219,6 +220,8 @@ def get_latest_signals_since(
             "price_at_signal": r[7],
             "detected_at": r[8],
             "session": r[9],
+            "origin": r[10],
+            "crossed_at": r[11],
         }
         for r in cursor.fetchall()
     ]

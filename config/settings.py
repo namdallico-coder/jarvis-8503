@@ -44,7 +44,13 @@ news_settings = NewsSettings()
 class DecisionSettings:
     decision_interval_sec: int = 15 * 60  # 15분마다 유니버스 전체 판단
     price_lookback_hours: int = 1  # 시세 흐름 조회 범위
-    request_delay_sec: float = 1.0  # 종목별 Claude 호출 간 요청 간격 (레이트리밋 여유)
+    request_delay_sec: float = 1.0  # (Claude 시절 호출 간격 — rule-v1에서는 미사용, 설정만 유지)
+
+    # rule-v1 (decision/rule_engine.py): 신호 직전 lookback 동안 신호 방향으로 이미
+    # momentum_cap_pct 넘게 움직였으면 추격으로 보고 hold. 값의 근거는 rule_engine 독스트링 참고.
+    rule_lookback_min: int = 15
+    rule_momentum_cap_pct: float = 0.3
+    rule_price_tolerance_sec: int = 600  # lookback 시점 시세가 이보다 오래됐으면 "데이터 부족"
 
 
 decision_settings = DecisionSettings()

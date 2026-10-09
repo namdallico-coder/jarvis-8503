@@ -1,14 +1,16 @@
-"""8503 AI 판단 레이어 진입점 (신호 리뷰 방식).
+"""8503 판단 레이어 진입점 (신호 리뷰 방식, rule-v1).
 
-AI가 처음부터 매매 판단을 만들어내지 않는다. signals/가 먼저 계산해둔 이동평균
-크로스 신호(golden_cross/dead_cross)를 가져와서, 그 신호를 "따를지(follow)
-보류할지(hold)"만 Claude에게 검토시킨다. 최근 decision_interval_sec(기본 15분)
-안에 신호가 없던 종목은 AI 호출 자체를 하지 않는다 (비용 절감).
+signals/가 먼저 계산해둔 이동평균 크로스 신호(golden_cross/dead_cross)를 가져와서,
+그 신호를 "따를지(follow) 보류할지(hold)"를 decision/rule_engine.py의 규칙으로 판정한다
+(외부 AI API 호출 없음 — 이전에는 Claude가 이 판정을 했고, 그 기록은 decisions.model이
+"claude-sonnet-5"인 행으로 남아 있다). 최근 decision_interval_sec(기본 15분) 안에 신호가
+없던 종목은 판단하지 않는다.
 
 follow로 판단되면 신호 방향(golden_cross->buy, dead_cross->sell)을 최종 action으로,
-hold면 action=hold로 decisions 테이블에 저장한다. 페이퍼 모드 — 실제 매매는 없다.
+hold면 action=hold로 decisions 테이블에 저장한다(model="rule-v1"). 페이퍼 모드 — 실제
+매매는 없다.
 
-AI 호출을 아끼는 규칙 세 가지:
+판정 대상을 줄이는 규칙 세 가지 (Claude 시절 비용 절감용이었으나 그대로 유지):
   - 장외(session=extended: NXT/프리마켓 등) 신호는 호출하지 않는다 — 정규장 신호만 검토한다.
     장외 신호는 signals 테이블에 태그된 채로 남아 있고, 스킵 건수만 로그로 남긴다.
   - 미보유 종목의 dead_cross는 호출하지 않는다 — 팔 포지션이 없어서 sell이 나와도
@@ -30,8 +32,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict
 
 from config.settings import decision_settings
-from decision.claude_client import ClaudeClient
-from decision.context_builder import build_context
+from decision.rule_engine import MODEL_NAME, evaluate
 from db.repository import (
     get_connection,
     init_db,
@@ -40,7 +41,7 @@ from db.repository import (
     get_reviewed_signal_ids,
     save_decision,
 )
-from risk_gate.portfolio import is_held
+from risk_gate.portfolio import get_holding_state, is_held
 
 logger = logging.getLogger("decision")
 
@@ -51,6 +52,7 @@ SIGNAL_TO_FOLLOW_ACTION = {
     "dead_cross": "sell",
 }
 
+# 아래 SYSTEM_PROMPT는 Claude 시절(decision/claude_client.py) 용도다. rule-v1에서는 쓰이지 않는다.
 SYSTEM_PROMPT = """너는 한국 주식시장 개별 종목의 이동평균 크로스 신호를 검토하는 애널리스트다.
 코드가 이미 계산한 크로스 신호(signal: golden_cross 또는 dead_cross, 발생 시점의 단기/장기
 이동평균과 가격 포함) 1건이 주어진다. 이 신호를 최근 1시간 시세 흐름(price_history_1h),
@@ -89,32 +91,34 @@ def _final_action(ai_action: str, signal_type: str) -> str:
 
 
 async def review_one(
-    client: ClaudeClient,
     conn: sqlite3.Connection,
     stk_cd: str,
     stk_nm: str,
     signal: Dict[str, Any],
     as_of: datetime | None = None,
 ) -> None:
-    """as_of: 옛 신호를 재검토할 때 "최근 1시간"을 그 시점 기준으로 계산하려고 쓴다
-    (실시간 운영에서는 생략 — build_context()와 동일한 용도)."""
-    context = build_context(conn, stk_cd, stk_nm, signal, as_of=as_of)
-    user_content = json.dumps(context, ensure_ascii=False, indent=2)
-
+    """신호 1건을 rule-v1으로 판정해 decisions에 저장한다. as_of: 옛 신호를 재판정할 때
+    보유 상태를 그 시점 기준으로 재구성하려고 쓴다 (실시간 운영에서는 생략)."""
+    holding = get_holding_state(conn, stk_cd, as_of=as_of)
     try:
-        result = await client.review_signal(SYSTEM_PROMPT, user_content)
+        result = evaluate(conn, signal, holding)
     except Exception:
-        logger.exception("신호 리뷰 실패: %s(%s) signal_id=%s", stk_nm, stk_cd, signal["id"])
+        logger.exception("신호 판정 실패: %s(%s) signal_id=%s", stk_nm, stk_cd, signal["id"])
         return
 
     if not _validate(result):
         logger.warning(
-            "리뷰 결과 형식이 이상해서 저장하지 않음: %s(%s) -> %s", stk_nm, stk_cd, result
+            "판정 결과 형식이 이상해서 저장하지 않음: %s(%s) -> %s", stk_nm, stk_cd, result
         )
         return
 
     final_action = _final_action(result["action"], signal["signal_type"])
     decided_at = datetime.now(timezone.utc).isoformat()
+    context = {
+        "signal": {k: signal[k] for k in ("signal_type", "price_at_signal", "detected_at", "origin", "session")},
+        "features": result["features"],
+        "holding": holding,
+    }
     save_decision(
         conn,
         {
@@ -126,11 +130,11 @@ async def review_one(
             "confidence": result["confidence"],
             "reason": result["reason"],
             "context_snapshot": json.dumps(context, ensure_ascii=False),
-            "model": client.model,
+            "model": MODEL_NAME,
         },
     )
     logger.info(
-        "[%s] %s: %s -> AI %s(confidence=%s) -> 최종 %s : %s",
+        "[%s] %s: %s -> %s(confidence=%s) -> 최종 %s : %s",
         stk_cd,
         stk_nm,
         signal["signal_type"],
@@ -149,8 +153,8 @@ def is_actionable(conn: sqlite3.Connection, signal: Dict[str, Any], as_of: datet
     return True
 
 
-async def collect_once(client: ClaudeClient, conn: sqlite3.Connection) -> tuple[int, int, int]:
-    """반환: (AI로 리뷰한 건수, 미보유 dead_cross라 스킵한 건수, 장외 신호라 스킵한 건수)."""
+async def collect_once(conn: sqlite3.Connection) -> tuple[int, int, int]:
+    """반환: (판정한 건수, 미보유 dead_cross라 스킵한 건수, 장외 신호라 스킵한 건수)."""
     since = (
         datetime.now(timezone.utc) - timedelta(seconds=decision_settings.decision_interval_sec)
     ).isoformat()
@@ -160,12 +164,12 @@ async def collect_once(client: ClaudeClient, conn: sqlite3.Connection) -> tuple[
     ]
     if extended_skipped:
         logger.info(
-            "장외(extended) 신호 %d건은 정규장 신호만 검토하는 규칙에 따라 AI 호출 스킵: %s",
+            "장외(extended) 신호 %d건은 정규장 신호만 판정하는 규칙에 따라 스킵: %s",
             len(extended_skipped),
             ", ".join(s["stk_cd"] for s in extended_skipped),
         )
     if not latest:
-        logger.info("최근 %d초 안에 정규장 신호 없음 — AI 호출 없이 넘어감", decision_settings.decision_interval_sec)
+        logger.info("최근 %d초 안에 정규장 신호 없음 — 판정 없이 넘어감", decision_settings.decision_interval_sec)
         return 0, 0, len(extended_skipped)
 
     reviewed_ids = get_reviewed_signal_ids(conn, [s["id"] for s in latest])
@@ -181,19 +185,17 @@ async def collect_once(client: ClaudeClient, conn: sqlite3.Connection) -> tuple[
 
     if skipped:
         logger.info(
-            "미보유 종목 dead_cross %d건은 매도할 포지션이 없어 AI 호출 스킵: %s",
+            "미보유 종목 dead_cross %d건은 매도할 포지션이 없어 판정 스킵: %s",
             len(skipped),
             ", ".join(s["stk_cd"] for s in skipped),
         )
 
     name_by_code = {s["stk_cd"]: s["stk_nm"] for s in get_latest_universe(conn)}
 
-    for i, signal in enumerate(targets):
+    for signal in targets:
         stk_cd = signal["stk_cd"]
         stk_nm = name_by_code.get(stk_cd, stk_cd)
-        await review_one(client, conn, stk_cd, stk_nm, signal)
-        if i + 1 < len(targets):
-            await asyncio.sleep(decision_settings.request_delay_sec)
+        await review_one(conn, stk_cd, stk_nm, signal)
 
     return len(targets), len(skipped), len(extended_skipped)
 
@@ -204,19 +206,17 @@ async def run() -> None:
     conn = get_connection()
     init_db(conn)
 
-    client = ClaudeClient()
     try:
         while True:
-            reviewed, skipped, ext_skipped = await collect_once(client, conn)
+            reviewed, skipped, ext_skipped = await collect_once(conn)
             logger.info(
-                "decision cycle done: %d signals reviewed, %d skipped(미보유 dead_cross), %d skipped(장외)",
+                "decision cycle done: %d signals judged, %d skipped(미보유 dead_cross), %d skipped(장외)",
                 reviewed,
                 skipped,
                 ext_skipped,
             )
             await asyncio.sleep(decision_settings.decision_interval_sec)
     finally:
-        await client.close()
         conn.close()
 
 
