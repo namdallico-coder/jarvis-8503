@@ -1,0 +1,19 @@
+[Unit]
+Description=JARVIS 8503 Closing Bet (종가배팅 규칙3 가상매매, 페이퍼 전용)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/jarvis-field/8503
+Environment=PYTHONPATH=/home/ubuntu/jarvis-field/8503
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/ubuntu/jarvis-field/8503/config/.env
+ExecStart=/home/ubuntu/jarvis-field/8503/venv/bin/python -m closing_bet.main
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
