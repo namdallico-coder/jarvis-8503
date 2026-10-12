@@ -12,7 +12,7 @@ from datetime import datetime, time
 from closing_bet import store
 from closing_bet.config import KST, settings
 from closing_bet.jobs import DONE, run_exit, run_finalize, run_judge
-from closing_bet.kiwoom_api import KiwoomAPI
+from closing_bet.kiwoom_api import EX_CONFIG, SHARED_WARNING, KiwoomAPI, KiwoomConfigError
 
 logger = logging.getLogger("closing_bet")
 EXIT_SLOW_RETRY_SEC = 600  # 개장 직후 창(09:10) 이후에는 10분 간격으로만 재시도
@@ -34,10 +34,30 @@ async def _with_api(fn, conn, now):
     return await fn(conn, settings, _api, now)
 
 
+def init_api(conn) -> KiwoomAPI:
+    """키움 클라이언트를 만든다. 키 설정이 없으면 KiwoomConfigError. 공유 키 모드면 WARNING 로그와 cb_events 기록을 남긴다."""
+    api = KiwoomAPI()
+    if api.shared_key:
+        store.log_event(conn, datetime.now(KST).strftime("%Y-%m-%d"), "shared_key_mode", SHARED_WARNING, logging.WARNING)
+    return api
+
+
 async def run() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
     conn = store.connect(settings.db_path)
+    global _api
+    try:  # 키 설정이 없으면 시작하지 않는다 (키움 호출은 첫 작업 시각까지 없으므로 여기서 미리 검증)
+        _api = init_api(conn)
+    except KiwoomConfigError as e:
+        logger.critical("closing_bet 시작 불가: %s", e)
+        raise SystemExit(EX_CONFIG)
+    today = datetime.now(KST).strftime("%Y-%m-%d")
+    try:  # 시작 시 토큰을 한 번 발급받아 키가 유효한지 확인한다 (실패해도 서비스는 유지, 작업 시각에 재시도)
+        expires = await _api.verify_token()
+        store.log_event(conn, today, "token_ok", f"토큰 발급 확인 (만료 {expires} KST)")
+    except Exception as e:
+        store.log_event(conn, today, "token_failed", f"시작 시 토큰 발급 실패: {type(e).__name__}: {str(e)[:160]}", logging.ERROR)
     last_exit_try = 0.0
     logger.info("closing_bet 시작 (페이퍼 전용), db=%s, rho=%s, threshold=%s", settings.db_path, settings.rho, settings.ratio_threshold)
     while True:

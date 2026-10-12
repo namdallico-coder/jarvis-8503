@@ -8,8 +8,10 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Awaitable, Callable, Dict, List, TypeVar
 
+from closing_bet.config import KST
 from collector.kiwoom_client import KiwoomQuoteClient, QuoteClientError
 
 logger = logging.getLogger("closing_bet")
@@ -32,14 +34,67 @@ def _float(v: Any) -> float:
     return float(str(v).replace(",", "").replace("+", "")) if v not in (None, "") else 0.0
 
 
+ENV_APP_KEY = "CB_KIWOOM_APP_KEY"
+ENV_SECRET_KEY = "CB_KIWOOM_SECRET_KEY"
+ENV_ALLOW_SHARED = "CB_ALLOW_SHARED_KEY"
+SHARED_WARNING = "공유 키 모드: collector와 토큰 충돌 가능"
+EX_CONFIG = 78  # sysexits EX_CONFIG: 설정 오류 — systemd RestartPreventExitStatus로 재시작 루프를 막는다
+
+
+class KiwoomConfigError(RuntimeError):
+    """사용할 앱키를 정할 수 없을 때 (전용 키 미설정 + 공유 키 모드 미허용, 전용 키가 collector와 같음 등)."""
+
+
+def resolve_keys() -> tuple[str, str, bool]:
+    """(app_key, secret_key, shared) — 값은 어떤 메시지에도 싣지 않는다.
+
+    1) CB_KIWOOM_APP_KEY/CB_KIWOOM_SECRET_KEY(전용 키)가 있으면 그것을 쓴다. 둘 다 있어야 하고 collector 키와 달라야 한다.
+    2) 전용 키가 없으면 CB_ALLOW_SHARED_KEY=1 로 명시적으로 허용했을 때만 collector의 KIWOOM_APP_KEY/SECRET_KEY를 쓴다
+       (허용 IP당 앱키가 하나뿐이라 분리가 불가능한 경우). 같은 앱키를 두 프로세스가 쓰면 한쪽이 토큰을 새로 발급할 때
+       다른 쪽 토큰이 무효화될 수 있다(8005).
+    3) 그 외에는 시작을 거부한다 — 조용한 폴백 금지.
+    """
+    app = (os.environ.get(ENV_APP_KEY) or "").strip()
+    sec = (os.environ.get(ENV_SECRET_KEY) or "").strip()
+    c_app = (os.environ.get("KIWOOM_APP_KEY") or "").strip()
+    c_sec = (os.environ.get("KIWOOM_SECRET_KEY") or "").strip()
+    if app or sec:
+        missing = [n for n, v in ((ENV_APP_KEY, app), (ENV_SECRET_KEY, sec)) if not v]
+        if missing:
+            raise KiwoomConfigError(f"closing_bet 전용 키움 앱키 환경변수가 불완전합니다: 없는 항목 {', '.join(missing)}.")
+        if app == c_app:
+            raise KiwoomConfigError(
+                f"{ENV_APP_KEY}가 collector의 KIWOOM_APP_KEY와 같은 값입니다. 별도로 발급한 앱키를 넣거나, "
+                f"공유가 의도라면 {ENV_APP_KEY}/{ENV_SECRET_KEY}를 지우고 {ENV_ALLOW_SHARED}=1 을 설정하세요.")
+        return app, sec, False
+    if (os.environ.get(ENV_ALLOW_SHARED) or "").strip() == "1":
+        if not c_app or not c_sec:
+            raise KiwoomConfigError(f"{ENV_ALLOW_SHARED}=1 이지만 KIWOOM_APP_KEY/KIWOOM_SECRET_KEY가 없습니다.")
+        return c_app, c_sec, True
+    raise KiwoomConfigError(
+        f"closing_bet 키움 앱키 설정이 없습니다: {ENV_APP_KEY}/{ENV_SECRET_KEY}를 설정하거나, collector와 같은 키를 쓰는 것을 "
+        f"감수한다면 {ENV_ALLOW_SHARED}=1 을 명시하세요 (조용히 collector 키로 폴백하지 않습니다 — 같은 키를 쓰면 토큰이 서로 무효화될 수 있습니다)."
+    )
+
+
 class KiwoomAPI:
     """jobs.py가 기대하는 3개 메서드(ranking/quote/ordinary)를 구현한다. 테스트에서는 같은 메서드를 가진 가짜로 대체한다."""
 
     def __init__(self, client: KiwoomQuoteClient | None = None) -> None:
-        self.client = client or KiwoomQuoteClient()
+        self.shared_key = False
+        if client is None:
+            app, sec, self.shared_key = resolve_keys()
+            client = KiwoomQuoteClient(app_key=app, secret_key=sec)
+        self.client = client
 
     async def close(self) -> None:
         await self.client.close()
+
+    async def verify_token(self) -> str:
+        """토큰이 없으면 발급받고 만료 시각(KST 문자열)을 돌려준다. 토큰 값은 노출하지 않는다."""
+        await self.client._get_access_token()
+        exp = self.client._token_expires_at
+        return exp.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S") if exp else "알 수 없음"
 
     async def _auth_retry(self, fn: Callable[[], Awaitable[T]]) -> T:
         """토큰이 무효(8005)면 토큰을 다시 발급받아 한 번만 재시도한다 (collector의 _post는 401만 재시도한다)."""
