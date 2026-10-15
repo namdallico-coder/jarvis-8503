@@ -159,6 +159,15 @@ class KiwoomQuoteClient:
         ).astimezone(timezone.utc)
         return self._token
 
+    @staticmethod
+    def _is_token_invalid(response: httpx.Response) -> bool:
+        """키움은 토큰 무효를 HTTP 401이 아니라 HTTP 200 + return_code=3 + 메시지 '[8005:...]'로 돌려준다."""
+        try:
+            data = response.json()
+        except ValueError:
+            return False
+        return data.get("return_code") == 3 and "8005" in str(data.get("return_msg", ""))
+
     async def _post(
         self,
         path: str,
@@ -166,7 +175,7 @@ class KiwoomQuoteClient:
         body: Optional[Dict[str, Any]] = None,
         extra_headers: Optional[Dict[str, str]] = None,
     ) -> httpx.Response:
-        """인증 헤더를 붙여 POST 하고, 401이면 토큰을 한 번 재발급해 재시도한다."""
+        """인증 헤더를 붙여 POST 하고, 401 또는 토큰 무효(8005)면 토큰을 한 번 재발급해 재시도한다."""
         token = await self._get_access_token()
         headers = {
             "Content-Type": "application/json;charset=UTF-8",
@@ -178,7 +187,7 @@ class KiwoomQuoteClient:
 
         response = await self._client.post(path, json=body or {}, headers=headers)
 
-        if response.status_code == 401:
+        if response.status_code == 401 or self._is_token_invalid(response):
             token = await self._get_access_token(force_refresh=True)
             headers["authorization"] = f"Bearer {token}"
             response = await self._client.post(path, json=body or {}, headers=headers)

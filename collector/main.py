@@ -24,9 +24,18 @@ logger = logging.getLogger("collector")
 async def collect_once(client: KiwoomQuoteClient, symbols: list[str], conn: sqlite3.Connection) -> None:
     quotes = await client.fetch_quotes(symbols)
     collected_at = datetime.now(timezone.utc).isoformat()
+    # 키움 점검 시간대에는 return_code가 정상인데 현재가/거래량이 빈 값(None)으로 오는 응답이 있다.
+    # prices.cur_prc/trde_qty는 NOT NULL이라 그대로 저장하면 프로세스가 죽는다 -> None인 시세만 건너뛴다(0은 정상 값).
+    skipped = [q["stk_cd"] for q in quotes if q["cur_prc"] is None or q["trde_qty"] is None]
+    if skipped:
+        logger.warning("빈 시세 %d건 스킵(키움 점검 시간대 가능): %s", len(skipped), ", ".join(skipped))
+    saved = 0
     for quote in quotes:
+        if quote["cur_prc"] is None or quote["trde_qty"] is None:
+            continue
         save_price(conn, quote, collected_at)
-    logger.info("collected %d quotes", len(quotes))
+        saved += 1
+    logger.info("collected %d quotes", saved)
 
 
 async def run() -> None:
