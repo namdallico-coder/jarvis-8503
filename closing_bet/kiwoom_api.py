@@ -77,6 +77,19 @@ def resolve_keys() -> tuple[str, str, bool]:
     )
 
 
+class _LoggedClient(KiwoomQuoteClient):
+    """토큰 발급(oauth2/token)에 성공할 때마다 INFO 로그를 남기는 closing-bet 전용 클라이언트.
+    출력하는 것은 이벤트 결과와 만료 시각뿐이며 토큰/앱키/시크릿 값은 절대 출력하지 않는다.
+    이전 만료 시각과 같으면 키움이 기존 토큰을 그대로 돌려준 것이다(새 토큰이면 만료 시각이 바뀐다)."""
+
+    async def _issue_token_once(self) -> str:
+        previous = self._token_expires_at
+        token = await super()._issue_token_once()
+        fmt = lambda d: d.astimezone(KST).strftime("%Y-%m-%d %H:%M:%S") if d else "없음"
+        logger.info("토큰 발급 성공 — 만료 %s KST (이전 만료 %s)", fmt(self._token_expires_at), fmt(previous))
+        return token
+
+
 class KiwoomAPI:
     """jobs.py가 기대하는 3개 메서드(ranking/quote/ordinary)를 구현한다. 테스트에서는 같은 메서드를 가진 가짜로 대체한다."""
 
@@ -84,7 +97,7 @@ class KiwoomAPI:
         self.shared_key = False
         if client is None:
             app, sec, self.shared_key = resolve_keys()
-            client = KiwoomQuoteClient(app_key=app, secret_key=sec)
+            client = _LoggedClient(app_key=app, secret_key=sec)
         self.client = client
 
     async def close(self) -> None:

@@ -53,6 +53,25 @@ class TokenInvalidRetryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.api_auth_headers, ["Bearer T1", "Bearer T2"])     # 재시도는 새 토큰으로
         await client.close()
 
+    async def test_8005_detection_is_logged_without_secrets(self):
+        fake = FakeKiwoom([(200, TOKEN_INVALID), (200, OK_QUOTE)])
+        client = await make_client(fake)
+        with self.assertLogs("collector.kiwoom_client", level="INFO") as cm:
+            await client.request("/api/dostk/stkinfo", "ka10001", {"stk_cd": "005930"})
+        lines = [m for m in cm.output if "8005" in m]
+        self.assertEqual(len(lines), 1, cm.output)                       # 8005 감지당 정확히 1줄
+        self.assertIn("api_id=ka10001", lines[0])
+        for secret in ("T1", "T2", "test-app", "test-secret", "Bearer"):  # 토큰/키/헤더 값이 로그에 없어야 한다
+            self.assertNotIn(secret, " ".join(cm.output))
+        await client.close()
+
+    async def test_no_8005_log_on_normal_response(self):
+        fake = FakeKiwoom([(200, OK_QUOTE)])
+        client = await make_client(fake)
+        with self.assertNoLogs("collector.kiwoom_client", level="INFO"):
+            await client.request("/api/dostk/stkinfo", "ka10001", {"stk_cd": "005930"})
+        await client.close()
+
     async def test_8005_after_retry_raises_without_infinite_loop(self):
         fake = FakeKiwoom([(200, TOKEN_INVALID)])                               # 계속 8005
         client = await make_client(fake)

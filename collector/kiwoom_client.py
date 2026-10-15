@@ -187,7 +187,10 @@ class KiwoomQuoteClient:
 
         response = await self._client.post(path, json=body or {}, headers=headers)
 
-        if response.status_code == 401 or self._is_token_invalid(response):
+        token_invalid_8005 = self._is_token_invalid(response)
+        if response.status_code == 401 or token_invalid_8005:
+            if token_invalid_8005:
+                logger.info("토큰 무효(8005) 감지 — 토큰 재발급 후 같은 요청 1회 재시도: api_id=%s", api_id)
             token = await self._get_access_token(force_refresh=True)
             headers["authorization"] = f"Bearer {token}"
             response = await self._client.post(path, json=body or {}, headers=headers)

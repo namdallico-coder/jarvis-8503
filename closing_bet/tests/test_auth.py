@@ -155,3 +155,51 @@ class DedicatedKeyTests(unittest.TestCase):
                 continue
             reads += [(p.name, m) for m in pat.findall(p.read_text(encoding="utf-8"))]
         self.assertTrue(reads and all(name == "kiwoom_api.py" for name, _ in reads), reads)  # 키 해석은 kiwoom_api.py 한 곳에서만
+
+
+class TokenIssueLogTests(unittest.IsolatedAsyncioTestCase):
+    """closing-bet 클라이언트가 토큰 발급 성공 시 만료 시각만 INFO로 남기고 민감값은 남기지 않는지."""
+
+    async def _client(self, tokens_issued):
+        import httpx
+        from datetime import datetime, timedelta, timezone
+        from closing_bet.kiwoom_api import _LoggedClient
+        kst = timezone(timedelta(hours=9))
+
+        def handler(request):
+            tokens_issued.append(1)
+            exp = (datetime.now(kst) + timedelta(hours=24)).strftime("%Y%m%d%H%M%S")
+            return httpx.Response(200, json={"token": f"SECRET-TOKEN-{len(tokens_issued)}", "expires_dt": exp, "return_code": 0})
+
+        client = _LoggedClient(app_key="cb-app-key", secret_key="cb-secret-key", use_mock=True)
+        await client._client.aclose()
+        client._client = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(handler))
+        return client
+
+    async def test_issue_success_is_logged_with_expiry_only(self):
+        issued = []
+        client = await self._client(issued)
+        with self.assertLogs("closing_bet", level="INFO") as cm:
+            await client._get_access_token()
+            await client._get_access_token(force_refresh=True)          # 갱신 한 번 더
+        lines = [m for m in cm.output if "토큰 발급 성공" in m]
+        self.assertEqual(len(lines), 2, cm.output)
+        self.assertIn("이전 만료 없음", lines[0])                          # 첫 발급
+        self.assertRegex(lines[1], r"만료 \d{4}-\d\d-\d\d \d\d:\d\d:\d\d KST \(이전 만료 \d{4}")   # 갱신: 이전 만료 시각 표시
+        joined = " ".join(cm.output)
+        for secret in ("SECRET-TOKEN", "cb-app-key", "cb-secret-key"):
+            self.assertNotIn(secret, joined)
+        await client.close()
+
+    async def test_failed_issue_is_not_logged_as_success(self):
+        import httpx
+        from closing_bet.kiwoom_api import _LoggedClient
+        from collector.kiwoom_client import QuoteClientError
+        client = _LoggedClient(app_key="a", secret_key="b", use_mock=True)
+        await client._client.aclose()
+        client._client = httpx.AsyncClient(base_url=client.base_url, transport=httpx.MockTransport(
+            lambda r: httpx.Response(200, json={"return_code": 3, "return_msg": "인증에 실패했습니다[8001:App Key와 Secret Key 검증에 실패했습니다]"})))
+        with self.assertNoLogs("closing_bet", level="INFO"):
+            with self.assertRaises(QuoteClientError):
+                await client._get_access_token()
+        await client.close()
